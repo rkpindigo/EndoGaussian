@@ -21,6 +21,7 @@ import imageio.v2 as iio
 import cv2
 import torch
 import fpsample
+import torchvision.transforms as T
 
 import torch.nn.functional as F
 
@@ -616,6 +617,7 @@ class Hamlyn_Dataset(object):
         print(f"imgs, masks, and depths loaded, total num:{len(imgs)}")
         print(f"interp imgs loaded, total num:{len(imgs_interp)}")
         
+        print(f"DEBUG: Found {len(imgs)} images, {len(depths)} depths, {len(imgs_interp)} interp images")
         imgs, masks, depths, imgs_interp, masks_interp = \
             [torch.stack(lst, dim=0) for lst in [imgs, masks, depths, imgs_interp, masks_interp]]
         

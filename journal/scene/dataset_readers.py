@@ -282,7 +282,8 @@ def readScaredInfo(datadir, mode, init_pts):
                            video_cameras=video_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
-                           maxtime=maxtime)
+                           maxtime=maxtime,
+                           interp_cameras=None)
 
     return scene_info
 

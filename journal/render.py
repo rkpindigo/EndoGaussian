@@ -184,6 +184,7 @@ def reconstruct_point_cloud(images, masks, depths, camera_parameters, name):
             project_valid_depth_only=True
         )
         o3d.io.write_point_cloud(os.path.join(output_frame_folder, 'frame_{}.ply'.format(i_frame)), pcd)
+        print("Saved frame {} point cloud.".format(i_frame))
 
 if __name__ == "__main__":
     import psutil

@@ -119,6 +119,8 @@ class deform_network(nn.Module):
         self.apply(initialize_weights)
     
     def forward(self, point, scales=None, rotations=None, opacity=None, times_sel=None):
+        if point.shape[0] == 0:
+            return point, scales, rotations, opacity
         if times_sel is not None:
             return self.forward_dynamic(point, scales, rotations, opacity, times_sel)
         else:
