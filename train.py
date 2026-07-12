@@ -66,6 +66,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     
     if not viewpoint_stack:
         viewpoint_stack = scene.getTrainCameras()
+
+    print("opacity_threshold_coarse:", opt.opacity_threshold_coarse)
+    print("opacity_threshold_fine_init:", opt.opacity_threshold_fine_init)
+    print("opacity_threshold_fine_after:", opt.opacity_threshold_fine_after)
     
     for iteration in range(first_iter, final_iter+1):        
         if network_gui.conn == None:
@@ -107,7 +111,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         radii_list = []
         visibility_filter_list = []
         viewspace_point_tensor_list = []
-        
+
         for viewpoint_cam in viewpoint_cams:
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage)
             image, depth, viewspace_point_tensor, visibility_filter, radii = \
@@ -168,10 +172,24 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             lpipsloss = lpips_loss(rendered_images,gt_images,lpips_model)
             loss += opt.lambda_lpips * lpipsloss
         
-        loss.backward()
+        if gaussians.get_xyz.shape[0] == 0:
+            print(f"Warning: Step {iteration} has 0 active Gaussians. Skipping backward pass to prevent CUDA overflow.")
+            #assign dummy loss or just clear optimizer gradients to safely skip
+            gaussians.optimizer.zero_grad(set_to_none=True)
+        else:
+            #run backward pass only if we have active points
+            loss.backward()
+            
+            #apply gradient clipping safety net
+            torch.nn.utils.clip_grad_norm_(gaussians.optimizer.param_groups[0]['params'], max_norm=1.0)
+
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
         for idx in range(0, len(viewspace_point_tensor_list)):
-            viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
+            if viewspace_point_tensor_list[idx].grad is not None:
+                viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
+            else:
+                print(f"Warning: Step {iteration} has no gradient for viewspace_point_tensor. This may indicate that all points are inactive or pruned. Skipping gradient accumulation for this frame.")
+                pass
         iter_end.record()
 
         with torch.no_grad():

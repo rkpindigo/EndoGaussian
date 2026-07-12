@@ -16,6 +16,8 @@ class Deformation(nn.Module):
         self.grid = HexPlaneField(args.bounds, args.kplanes_config, args.multires)
         self.pos_deform, self.scales_deform, self.rotations_deform, self.opacity_deform = self.create_net()
         self.args = args
+
+        self.register_buffer('max_time_encountered', torch.tensor(1.0))
         
     def create_net(self):
         mlp_out_dim = 0
@@ -40,6 +42,11 @@ class Deformation(nn.Module):
         else:
             grid_feature = self.grid(rays_pts_emb[:,:3], time_emb[:,:1])
             h = grid_feature
+
+        #if feature grid returns 0 active rows bypass linear layer and return empty tensor matching output dimension
+        if h.shape[0] == 0:
+            return torch.empty((0, 32), device=h.device, dtype=h.dtype)
+
         h = self.feature_out(h)
         return h
 

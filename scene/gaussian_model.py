@@ -461,7 +461,10 @@ class GaussianModel:
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
-    def densify(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify(self, max_grad, min_opacity, extent, max_screen_size, max_gaussians=500_000):
+        if max_gaussians and self.get_xyz.shape[0] >= max_gaussians:
+            return
+
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 

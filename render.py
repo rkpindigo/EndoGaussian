@@ -171,7 +171,17 @@ def reconstruct_point_cloud(images, masks, depths, camera_parameters, name):
         depth_smoother = (128, 64, 64)
         depth_np = cv2.bilateralFilter(depth_np, depth_smoother[0], depth_smoother[1], depth_smoother[2])
         
-        close_depth = np.percentile(depth_np[depth_np!=0], 5)
+        # close_depth = np.percentile(depth_np[depth_np!=0], 5)
+        # inf_depth = np.percentile(depth_np, 95)
+        # depth_np = np.clip(depth_np, close_depth, inf_depth)
+
+        valid_depth = depth_np[depth_np != 0]
+
+        if valid_depth.size == 0:
+            print(f"Warning: Frame has completely empty depth map. Skipping point cloud calculation for this frame.")
+            continue
+        
+        close_depth = np.percentile(valid_depth, 5)
         inf_depth = np.percentile(depth_np, 95)
         depth_np = np.clip(depth_np, close_depth, inf_depth)
 

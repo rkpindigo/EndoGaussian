@@ -53,8 +53,8 @@ class EndoNeRF_Dataset(object):
         mode='binocular'
     ):
         self.img_wh = (
-            int(640 / downsample),
-            int(512 / downsample),
+            int(1280 / downsample),
+            int(720 / downsample),
         )
         self.root_dir = datadir
         self.downsample = downsample 
@@ -113,6 +113,9 @@ class EndoNeRF_Dataset(object):
         else:
             raise ValueError(f"{self.mode} has not been implemented.")
         self.masks_paths = agg_fn("masks")
+
+        print(f"number of images: {len(self.image_paths)}")
+        print("Number of poses:", poses.shape[0])
 
         assert len(self.image_paths) == poses.shape[0], "the number of images should equal to the number of poses"
         assert len(self.depth_paths) == poses.shape[0], "the number of depth images should equal to number of poses"
