@@ -48,24 +48,45 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(gtdepth_path, exist_ok=True)
     makedirs(masks_path, exist_ok=True)
     
-    render_images = []
-    render_depths = []
-    gt_list = []
-    gt_depths = []
-    mask_list = []
+    video_dir = os.path.join(model_path, name, "ours_{}".format(iteration))
+    ours_writer = imageio.get_writer(os.path.join(video_dir, 'ours_video.mp4'), fps=30, quality=8)
+    gt_writer = imageio.get_writer(os.path.join(video_dir, 'gt_video.mp4'), fps=30, quality=8)
+
+    reconstruct_data = [] if reconstruct else None
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         stage = 'coarse' if no_fine else 'fine'
         rendering = render(view, gaussians, pipeline, background, stage=stage)
-        render_depths.append(rendering["depth"].cpu())
-        render_images.append(rendering["render"].cpu())
+        rendered_image = rendering["render"].cpu()
+        rendered_depth = rendering["depth"].cpu()
+ 
+        torchvision.utils.save_image(rendered_image, os.path.join(render_path, '{0:05d}.png'.format(idx)))
+        depth_np = np.clip(rendered_depth.squeeze().numpy().astype(np.uint8), 0, 255)
+        cv2.imwrite(os.path.join(depth_path, '{0:05d}.png'.format(idx)), depth_np)
+ 
+        frame = (rendered_image.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+        ours_writer.append_data(frame)
+
         if name in ["train", "test", "video"]:
             gt = view.original_image[0:3, :, :]
-            gt_list.append(gt)
             mask = view.mask
-            mask_list.append(mask)
             gt_depth = view.original_depth
-            gt_depths.append(gt_depth)
+
+            torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}.png'.format(idx)))
+            torchvision.utils.save_image(mask.float(), os.path.join(masks_path, '{0:05d}.png'.format(idx)))
+            gt_depth_np = gt_depth.cpu().squeeze().numpy().astype(np.uint8)
+            cv2.imwrite(os.path.join(gtdepth_path, '{0:05d}.png'.format(idx)), gt_depth_np)
+
+            gt_frame = (gt.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+            gt_writer.append_data(gt_frame)
+
+            if reconstruct:
+                reconstruct_data.append((rendered_image, mask, rendered_depth))
+
+        del rendered_image, rendered_depth
+
+    ours_writer.close()
+    gt_writer.close()
     
     if render_test:
         test_times = 50
@@ -77,59 +98,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 rendering = render(view, gaussians, pipeline, background, stage=stage)
         time2=time()
         print("FPS:",(len(views)-1)*test_times/(time2-time1))
-    
-    count = 0
-    print("writing training images.")
-    if len(gt_list) != 0:
-        for image in tqdm(gt_list):
-            torchvision.utils.save_image(image, os.path.join(gts_path, '{0:05d}'.format(count) + ".png"))
-            count+=1
-            
-    count = 0
-    print("writing rendering images.")
-    if len(render_images) != 0:
-        for image in tqdm(render_images):
-            torchvision.utils.save_image(image, os.path.join(render_path, '{0:05d}'.format(count) + ".png"))
-            count +=1
-    
-    count = 0
-    print("writing mask images.")
-    if len(mask_list) != 0:
-        for image in tqdm(mask_list):
-            image = image.float()
-            torchvision.utils.save_image(image, os.path.join(masks_path, '{0:05d}'.format(count) + ".png"))
-            count +=1
-    
-    count = 0
-    print("writing rendered depth images.")
-    if len(render_depths) != 0:
-        for image in tqdm(render_depths):
-            image = np.clip(image.cpu().squeeze().numpy().astype(np.uint8), 0, 255)
-            cv2.imwrite(os.path.join(depth_path, '{0:05d}'.format(count) + ".png"), image)
-            count += 1
-    
-    count = 0
-    print("writing gt depth images.")
-    if len(gt_depths) != 0:
-        for image in tqdm(gt_depths):
-            image = image.cpu().squeeze().numpy().astype(np.uint8)
-            cv2.imwrite(os.path.join(gtdepth_path, '{0:05d}'.format(count) + ".png"), image)
-            count += 1
-            
-    render_array = torch.stack(render_images, dim=0).permute(0, 2, 3, 1)
-    render_array = (render_array*255).clip(0, 255).cpu().numpy().astype(np.uint8)
-    imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'ours_video.mp4'), render_array, fps=30, quality=8)
-    
-    gt_array = torch.stack(gt_list, dim=0).permute(0, 2, 3, 1)
-    gt_array = (gt_array*255).clip(0, 255).cpu().numpy().astype(np.uint8)
-    imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'gt_video.mp4'), gt_array, fps=30, quality=8)
                     
     FoVy, FoVx, height, width = view.FoVy, view.FoVx, view.image_height, view.image_width
     focal_y, focal_x = fov2focal(FoVy, height), fov2focal(FoVx, width)
     camera_parameters = (focal_x, focal_y, width, height)
     
-    if reconstruct:
-        reconstruct_point_cloud(render_images, mask_list, render_depths, camera_parameters, name)
+    if reconstruct and reconstruct_data:
+        images, masks, depths = zip(*reconstruct_data)
+        reconstruct_point_cloud(list(images), list(masks), list(depths), camera_parameters, name)
 
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, reconstruct: bool):
     

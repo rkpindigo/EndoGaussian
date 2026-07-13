@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-from scene.hexplane import HexPlaneField
+from scene.hexplane import HexPlaneField, WindowedHexPlaneField
 
 class Deformation(nn.Module):
     def __init__(self, D=8, W=256, input_ch=27, input_ch_time=9, skips=[], args=None):
@@ -13,7 +13,16 @@ class Deformation(nn.Module):
         self.skips = skips
         self.no_grid = args.no_grid
         
-        self.grid = HexPlaneField(args.bounds, args.kplanes_config, args.multires)
+        use_windowed = getattr(args, 'use_windowed_hexplane', False)
+        if use_windowed and not args.no_grid:
+            window_size = getattr(args, 'hexplane_window_size', 100)
+            window_stride = getattr(args, 'hexplane_window_stride', 50)
+            n_frames = getattr(args, 'hexplane_n_frames', 608)
+            self.grid = WindowedHexPlaneField(args.bounds, args.kplanes_config, args.multires,
+                                              window_size=window_size, window_stride=window_stride, n_frames=n_frames)
+        else:
+            self.grid = HexPlaneField(args.bounds, args.kplanes_config, args.multires)
+
         self.pos_deform, self.scales_deform, self.rotations_deform, self.opacity_deform = self.create_net()
         self.args = args
 

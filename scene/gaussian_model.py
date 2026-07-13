@@ -23,7 +23,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.deformation import deform_network
 from scene.regulation import compute_plane_smoothness
-
+from scene.hexplane import WindowedHexPlaneField
 
 class GaussianModel:
 
@@ -504,10 +504,20 @@ class GaussianModel:
                         print(name," :",weight.grad.mean(), weight.grad.min(), weight.grad.max())
         print("-"*50)
     
+    def _is_windowed_grid(self):
+        return is_instance(self._deformation.deformation_net.grid, WindowedHexPlaneField)
+
     def _plane_regulation(self):
-        multi_res_grids = self._deformation.deformation_net.grid.grids
+        grid = self._deformation.deformation_net.grid
+        if self._is_windowed_grid():
+            total = 0
+            for sp in grid.spatial_grids:
+                for p in sp:
+                    total += compute_plane_smoothness(p)
+            return total
+        multi_res_grids = grid.grids
+
         total = 0
-        # model.grids is 6 x [1, rank * F_dim, reso, reso]
         for grids in multi_res_grids:
             if len(grids) == 3:
                 time_grids = []
@@ -519,8 +529,16 @@ class GaussianModel:
 
     def _time_regulation(self):
         multi_res_grids = self._deformation.deformation_net.grid.grids
+        grid = self._deformation.deformation_net.grid
+        if self._is_windowed_grid():
+            total = 0
+            for per_scale in grid.window_grids:
+                for window in per_scale:
+                    for p in window:
+                        total += compute_plane_smoothness(p)
+            return total
+        multi_res_grids = grid.grids
         total = 0
-        # model.grids is 6 x [1, rank * F_dim, reso, reso]
         for grids in multi_res_grids:
             if len(grids) == 3:
                 time_grids = []
@@ -531,15 +549,21 @@ class GaussianModel:
         return total
     
     def _l1_regulation(self):
-                # model.grids is 6 x [1, rank * F_dim, reso, reso]
-        multi_res_grids = self._deformation.deformation_net.grid.grids
+        grid = self._deformation.deformation_net.grid
+        if self._is_windowed_grid():
+            total = 0.0
+            for per_scale in grid.window_grids:
+                for window in per_scale:
+                    for p in window:
+                        total += torch.abs(1 - p).mean()
+            return total
+        multi_res_grids = grid.grids
 
         total = 0.0
         for grids in multi_res_grids:
             if len(grids) == 3:
                 continue
             else:
-                # These are the spatiotemporal grids
                 spatiotemporal_grids = [2, 4, 5]
             for grid_id in spatiotemporal_grids:
                 total += torch.abs(1 - grids[grid_id]).mean()

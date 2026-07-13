@@ -27,6 +27,12 @@ OptimizationParams = dict(
 )
 
 ModelHiddenParams = dict(
+    use_windowed_hexplane = True,
+    hexplane_window_size = 100,    # 100 temporal bins per window (1:1 with frames)
+    hexplane_window_stride = 50,   # 50% overlap between windows
+    hexplane_n_frames = 608,       # your sequence length
+
+
     kplanes_config = {
      'grid_dimensions': 2,
      'input_coordinate_dim': 4,

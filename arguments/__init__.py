@@ -101,6 +101,10 @@ class ModelHiddenParams(ParamGroup):
         self.no_ds=False
         self.no_dr=False
         self.no_do=False
+        self.use_windowed_hexplane=False
+        self.hexplane_window_size=100
+        self.hexplane_window_stride=50
+        self.hexplane_n_frames=608
         super().__init__(parser, "ModelHiddenParams")
         
 class OptimizationParams(ParamGroup):
