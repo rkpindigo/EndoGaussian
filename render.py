@@ -31,8 +31,6 @@ import os
 cpu_list = [0]
 os.sched_setaffinity(0, cpu_list)
 
-
-
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, no_fine, render_test=False, reconstruct=False):
@@ -52,13 +50,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     ours_writer = imageio.get_writer(os.path.join(video_dir, 'ours_video.mp4'), fps=30, quality=8)
     gt_writer = imageio.get_writer(os.path.join(video_dir, 'gt_video.mp4'), fps=30, quality=8)
 
-    reconstruct_data = [] if reconstruct else None
+    reconstruct_paths = [] if reconstruct else None
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         stage = 'coarse' if no_fine else 'fine'
         rendering = render(view, gaussians, pipeline, background, stage=stage)
         rendered_image = rendering["render"].cpu()
         rendered_depth = rendering["depth"].cpu()
+
+        img_out_path = os.path.join(render_path, '{0:05d}.png'.format(idx))
+        depth_out_path = os.path.join(depth_path, '{0:05d}.png'.format(idx))
  
         torchvision.utils.save_image(rendered_image, os.path.join(render_path, '{0:05d}.png'.format(idx)))
         depth_np = np.clip(rendered_depth.squeeze().numpy().astype(np.uint8), 0, 255)
@@ -72,8 +73,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             mask = view.mask
             gt_depth = view.original_depth
 
+            mask_out_path = os.path.join(masks_path, '{0:05d}.png'.format(idx))
+
             torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}.png'.format(idx)))
-            torchvision.utils.save_image(mask.float(), os.path.join(masks_path, '{0:05d}.png'.format(idx)))
+            torchvision.utils.save_image(mask.float(), mask_out_path)
             gt_depth_np = gt_depth.cpu().squeeze().numpy().astype(np.uint8)
             cv2.imwrite(os.path.join(gtdepth_path, '{0:05d}.png'.format(idx)), gt_depth_np)
 
@@ -81,7 +84,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             gt_writer.append_data(gt_frame)
 
             if reconstruct:
-                reconstruct_data.append((rendered_image, mask, rendered_depth))
+                reconstruct_paths.append((rendered_image, mask, rendered_depth))
 
         del rendered_image, rendered_depth
 
@@ -103,9 +106,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     focal_y, focal_x = fov2focal(FoVy, height), fov2focal(FoVx, width)
     camera_parameters = (focal_x, focal_y, width, height)
     
-    if reconstruct and reconstruct_data:
-        images, masks, depths = zip(*reconstruct_data)
-        reconstruct_point_cloud(list(images), list(masks), list(depths), camera_parameters, name)
+    if reconstruct and reconstruct_paths:
+        print(f"Reclaiming memory. Running streaming point cloud calculation for {len(reconstruct_paths)} frames...")
+        reconstruct_point_cloud_streaming(reconstruct_paths, camera_parameters, name)
 
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, reconstruct: bool):
     
@@ -126,35 +129,49 @@ def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : P
         if not skip_video:
             render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, dataset.no_fine, render_test=True, reconstruct=False)
 
-def reconstruct_point_cloud(images, masks, depths, camera_parameters, name):
+def reconstruct_point_cloud_streaming(reconstruct_paths, camera_parameters, name):
     import cv2
     import copy
     output_frame_folder = os.path.join("reconstruct", name)
     os.makedirs(output_frame_folder, exist_ok=True)
-    frames = np.arange(len(images))
-    # frames = [0]
+    
     focal_x, focal_y, width, height = camera_parameters
-    for i_frame in frames:
-        rgb_tensor = images[i_frame]
-        rgb_np = rgb_tensor.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).contiguous().to("cpu").numpy()
-        depth_np = depths[i_frame].cpu().numpy()
-        depth_np = depth_np.squeeze(0)
-        mask = masks[i_frame]
-        mask = mask.squeeze(0).cpu().numpy()
+    
+    for i_frame, path_bundle in enumerate(reconstruct_paths):
+        # Explicitly unpack and cast to string to satisfy OpenCV's path requirements
+        img_path = str(path_bundle[0])
+        mask_path = str(path_bundle[1])
+        depth_path = str(path_bundle[2])
+        
+        # Read files sequentially from disk to maintain a low RAM signature
+        rgb_np = cv2.imread(img_path)
+        if rgb_np is None:
+            print(f"Error: Could not read image path: {img_path}. Skipping frame {i_frame}.")
+            continue
+            
+        rgb_np = cv2.cvtColor(rgb_np, cv2.COLOR_BGR2RGB)
+        
+        # Read depth map raw (cv2.imread with -1 preserves pixel channel integrity)
+        depth_np = cv2.imread(depth_path, -1)
+        if depth_np is None:
+            print(f"Error: Could not read depth path: {depth_path}. Skipping frame {i_frame}.")
+            continue
+            
+        if len(depth_np.shape) == 3:
+            depth_np = depth_np[:, :, 0]
+        depth_np = depth_np.astype(np.float32)
+
+        mask = cv2.imread(mask_path, 0)
         
         rgb_new = copy.deepcopy(rgb_np)
 
         depth_smoother = (128, 64, 64)
         depth_np = cv2.bilateralFilter(depth_np, depth_smoother[0], depth_smoother[1], depth_smoother[2])
         
-        # close_depth = np.percentile(depth_np[depth_np!=0], 5)
-        # inf_depth = np.percentile(depth_np, 95)
-        # depth_np = np.clip(depth_np, close_depth, inf_depth)
-
         valid_depth = depth_np[depth_np != 0]
 
         if valid_depth.size == 0:
-            print(f"Warning: Frame has completely empty depth map. Skipping point cloud calculation for this frame.")
+            print(f"Warning: Frame {i_frame} has completely empty depth map. Skipping point cloud calculation.")
             continue
         
         close_depth = np.percentile(valid_depth, 5)
