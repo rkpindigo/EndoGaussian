@@ -154,8 +154,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         else:
             raise ValueError(f"{scene.mode} is not implemented.")
         
-        depth_tvloss = TV_loss(rendered_depths)
-        img_tvloss = TV_loss(rendered_images)
+        depth_tvloss = TV_loss(rendered_depths * masks)
+        img_tvloss = TV_loss(rendered_images * masks)
         tv_loss = 0.03 * (img_tvloss + depth_tvloss)
         
         loss = Ll1 + depth_loss + tv_loss
@@ -166,10 +166,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             tv_loss = gaussians.compute_regulation(2e-2, 2e-2, 2e-2)
             loss += tv_loss
         if opt.lambda_dssim != 0:
-            ssim_loss = ssim(rendered_images,gt_images)
+            ssim_loss = ssim(rendered_images * masks,gt_images * masks)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
         if opt.lambda_lpips !=0:
-            lpipsloss = lpips_loss(rendered_images,gt_images,lpips_model)
+            lpipsloss = lpips_loss(rendered_images * masks,gt_images * masks,lpips_model)
             loss += opt.lambda_lpips * lpipsloss
         
         if gaussians.get_xyz.shape[0] == 0:
