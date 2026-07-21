@@ -35,6 +35,78 @@ os.sched_setaffinity(0, cpu_list)
 
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
+def export_gaussian_tissue_point_cloud(gaussians, views, model_path, name, iteration, opacity_threshold=0.05):
+    output_folder = os.path.join(model_path, name, f"ours_{iteration}", "full_tissue_ply")
+    os.makedirs(output_folder, exist_ok=True)
+    
+    print(f"\n[EXPORT] Exporting filtered 3D Gaussian tissue point clouds (Opacity > {opacity_threshold})...")
+    
+    for idx, view in enumerate(tqdm(views, desc="Exporting Point Clouds")):
+        # 1. Retrieve view timestamp
+        if hasattr(view, 'time'):
+            time_val = view.time
+        elif hasattr(view, 'fid'):
+            time_val = view.fid
+        else:
+            time_val = idx / float(len(views))
+
+        # 2. Get base parameters
+        pts = gaussians.get_xyz
+        scales = gaussians.get_scaling
+        rotations = gaussians.get_rotation
+        opacity = gaussians.get_opacity
+
+        # 3. Time embedding
+        if isinstance(time_val, torch.Tensor):
+            time_tensor = time_val.to(pts.device)
+        else:
+            time_tensor = torch.tensor([time_val], device=pts.device, dtype=torch.float32)
+
+        if time_tensor.dim() == 1 and time_tensor.shape[0] == 1:
+            time_emb = time_tensor.expand(pts.shape[0], 1)
+        elif time_tensor.dim() == 0:
+            time_emb = time_tensor.unsqueeze(0).expand(pts.shape[0], 1)
+        else:
+            time_emb = time_tensor
+
+        # 4. Predict deformations
+        d_xyz, d_rotation, d_scaling, d_opacity = gaussians._deformation(
+            pts,
+            scales,
+            rotations,
+            opacity,
+            time_emb
+        )
+        
+        # Calculate dynamic positions and updated opacities
+        means3D = pts + d_xyz
+        
+        # Apply sigmoid if deformation model outputs logit offsets for opacity
+        if d_opacity is not None:
+            dynamic_opacity = torch.sigmoid(opacity + d_opacity)
+        else:
+            dynamic_opacity = opacity
+
+        # 5. OPACITY MASKING: Filter out invisible / low-confidence fog
+        mask = (dynamic_opacity > opacity_threshold).squeeze(-1)
+
+        filtered_xyz = means3D[mask].detach().cpu().numpy()
+        
+        # 6. Extract colors for remaining points
+        if hasattr(gaussians, 'get_colors'):
+            colors = gaussians.get_colors[mask].detach().cpu().numpy()
+        else:
+            shs = gaussians.get_features[mask, 0, :].detach().cpu().numpy()
+            colors = np.clip(shs * 0.28209479177387814 + 0.5, 0, 1)
+
+        # 7. Export filtered PLY
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(filtered_xyz)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        
+        save_path = os.path.join(output_folder, f"frame_{idx:05d}.ply")
+        o3d.io.write_point_cloud(save_path, pcd)
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, no_fine, render_test=False, reconstruct=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
@@ -129,7 +201,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     camera_parameters = (focal_x, focal_y, width, height)
     
     if reconstruct:
-        reconstruct_point_cloud(render_images, mask_list, render_depths, camera_parameters, name)
+        export_gaussian_tissue_point_cloud(gaussians, views, model_path, name, iteration)
+        #reconstruct_point_cloud(render_images, mask_list, render_depths, camera_parameters, name)
 
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, reconstruct: bool):
     
@@ -142,13 +215,15 @@ def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : P
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        print(f"Number of test cameras: {len(scene.getTestCameras())}")
         
         if not skip_train:
-            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.no_fine, reconstruct=False)
+            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.no_fine, render_test=True, reconstruct=reconstruct)
         if not skip_test:
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.no_fine, reconstruct=False)
+            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.no_fine, render_test=False, reconstruct=reconstruct)
         if not skip_video:
-            render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, dataset.no_fine, render_test=True, reconstruct=reconstruct)
+            render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, dataset.no_fine, render_test=False, reconstruct=reconstruct)
 
 def reconstruct_point_cloud(images, masks, depths, camera_parameters, name):
     import cv2
