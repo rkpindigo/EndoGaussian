@@ -35,79 +35,59 @@ os.sched_setaffinity(0, cpu_list)
 
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
-def export_gaussian_tissue_point_cloud(gaussians, views, model_path, name, iteration, opacity_threshold=0.05):
+def export_gaussian_tissue_point_cloud(gaussians, views, model_path, name, iteration):
+    """
+    Exports 3D Gaussian positions for each frame directly at its time step, 
+    preserving the tissue hidden behind tools and eliminating 2D edge artifacts.
+    """
     output_folder = os.path.join(model_path, name, f"ours_{iteration}", "full_tissue_ply")
     os.makedirs(output_folder, exist_ok=True)
     
-    print(f"\n[EXPORT] Exporting filtered 3D Gaussian tissue point clouds (Opacity > {opacity_threshold})...")
-    
+    print("Exporting full 3D Gaussian tissue point clouds...")
     for idx, view in enumerate(tqdm(views, desc="Exporting Point Clouds")):
-        # 1. Retrieve view timestamp
-        if hasattr(view, 'time'):
-            time_val = view.time
-        elif hasattr(view, 'fid'):
-            time_val = view.fid
-        else:
-            time_val = idx / float(len(views))
+        means3D = gaussians.get_xyz
 
-        # 2. Get base parameters
-        pts = gaussians.get_xyz
-        scales = gaussians.get_scaling
-        rotations = gaussians.get_rotation
-        opacity = gaussians.get_opacity
+        if hasattr(gaussians, '_deformation') and hasattr(gaussians, '_deformation_table'):
+            time = torch.tensor(view.time).to(means3D.device).repeat(means3D.shape[0], 1)
+            scales = gaussians._scaling
+            rotations = gaussians._rotation
+            opacity = gaussians._opacity
+            deformation_point = gaussians._deformation_table
 
-        # 3. Time embedding
-        if isinstance(time_val, torch.Tensor):
-            time_tensor = time_val.to(pts.device)
-        else:
-            time_tensor = torch.tensor([time_val], device=pts.device, dtype=torch.float32)
+            means3D_deform, sclaes_deform, rotations_deform, opacity_deform = gaussians._deformation(
+                means3D[deformation_point],
+                scales[deformation_point],
+                rotations[deformation_point],
+                opacity[deformation_point],
+                time[deformation_point]
+            )
 
-        if time_tensor.dim() == 1 and time_tensor.shape[0] == 1:
-            time_emb = time_tensor.expand(pts.shape[0], 1)
-        elif time_tensor.dim() == 0:
-            time_emb = time_tensor.unsqueeze(0).expand(pts.shape[0], 1)
-        else:
-            time_emb = time_tensor
-
-        # 4. Predict deformations
-        d_xyz, d_rotation, d_scaling, d_opacity = gaussians._deformation(
-            pts,
-            scales,
-            rotations,
-            opacity,
-            time_emb
-        )
+            means3D_final = torch.zeros_like(means3D)
+            means3D_final[deformation_point] = means3D_deform
+            means3D_final[~deformation_point] = means3D[~deformation_point]
         
-        # Calculate dynamic positions and updated opacities
-        means3D = pts + d_xyz
-        
-        # Apply sigmoid if deformation model outputs logit offsets for opacity
-        if d_opacity is not None:
-            dynamic_opacity = torch.sigmoid(opacity + d_opacity)
         else:
-            dynamic_opacity = opacity
+            means3D_final = means3D
 
-        # 5. OPACITY MASKING: Filter out invisible / low-confidence fog
-        mask = (dynamic_opacity > opacity_threshold).squeeze(-1)
-
-        filtered_xyz = means3D[mask].detach().cpu().numpy()
         
-        # 6. Extract colors for remaining points
-        if hasattr(gaussians, 'get_colors'):
-            colors = gaussians.get_colors[mask].detach().cpu().numpy()
-        else:
-            shs = gaussians.get_features[mask, 0, :].detach().cpu().numpy()
-            colors = np.clip(shs * 0.28209479177387814 + 0.5, 0, 1)
+        xyz = means3D_final.detach().cpu().numpy()
 
-        # 7. Export filtered PLY
+        shs = gaussians.get_features[:,0,:].detach().cpu().numpy()
+        colors = np.clip(shs * 0.28209479177387814 + 0.5, 0, 1)
+
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(filtered_xyz)
+        pcd.points = o3d.utility.Vector3dVector(xyz)
         pcd.colors = o3d.utility.Vector3dVector(colors)
         
+        cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        pcd = pcd.select_by_index(ind)
+
         save_path = os.path.join(output_folder, f"frame_{idx:05d}.ply")
         o3d.io.write_point_cloud(save_path, pcd)
+    
+    print("Done with reconstructions")
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, no_fine, render_test=False, reconstruct=False):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, no_fine, render_test=True, reconstruct=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -201,8 +181,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     camera_parameters = (focal_x, focal_y, width, height)
     
     if reconstruct:
-        export_gaussian_tissue_point_cloud(gaussians, views, model_path, name, iteration)
-        #reconstruct_point_cloud(render_images, mask_list, render_depths, camera_parameters, name)
+        # Render with white background to recover per-pixel alpha
+        white_bg = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device="cuda")
+        white_images = []
+        for idx, view in enumerate(tqdm(views, desc="Rendering white bg for alpha")):
+            stage = 'coarse' if no_fine else 'fine'
+            white_render = render(view, gaussians, pipeline, white_bg, stage=stage)
+            white_images.append(white_render["render"].cpu())
+        reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name)
 
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, reconstruct: bool):
     
@@ -215,59 +201,76 @@ def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : P
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
-        print(f"Number of test cameras: {len(scene.getTestCameras())}")
         
         if not skip_train:
-            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.no_fine, render_test=True, reconstruct=reconstruct)
+            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.no_fine, reconstruct=reconstruct)
         if not skip_test:
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.no_fine, render_test=False, reconstruct=reconstruct)
+            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.no_fine, render_test=True, reconstruct=reconstruct)
         if not skip_video:
-            render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, dataset.no_fine, render_test=False, reconstruct=reconstruct)
+            render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, dataset.no_fine, render_test=True, reconstruct=reconstruct)
 
-def reconstruct_point_cloud(images, masks, depths, camera_parameters, name):
+def reconstruct_point_cloud(black_images, white_images, depths, camera_parameters, name, alpha_threshold=0.5):
     import cv2
     import copy
     output_frame_folder = os.path.join("reconstruct", name)
     os.makedirs(output_frame_folder, exist_ok=True)
-    frames = np.arange(len(images))
-    # frames = [0]
+    frames = np.arange(len(black_images))
     focal_x, focal_y, width, height = camera_parameters
     for i_frame in frames:
-        rgb_tensor = images[i_frame]
+        # Compute per-pixel alpha from dual renders
+        # black_pixel = scene_color + final_T * 0 = scene_color
+        # white_pixel = scene_color + final_T * 1
+        # final_T = white_pixel - black_pixel (per channel, average for robustness)
+        black_np = black_images[i_frame].permute(1, 2, 0).numpy()
+        white_np = white_images[i_frame].permute(1, 2, 0).numpy()
+        final_T = (white_np - black_np).mean(axis=2)
+        alpha_map = 1.0 - np.clip(final_T, 0, 1)
+
+        rgb_tensor = black_images[i_frame]
         rgb_np = rgb_tensor.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).contiguous().to("cpu").numpy()
         depth_np = depths[i_frame].cpu().numpy()
         depth_np = depth_np.squeeze(0)
-        mask = masks[i_frame]
-        mask = mask.squeeze(0).cpu().numpy()
-        
+
         rgb_new = copy.deepcopy(rgb_np)
+
+        # Zero out depth where alpha is low (transparent pixels)
+        depth_np[alpha_map < alpha_threshold] = 0
+
+        #zero out depth where pixels are opaque but have garbage colors
+        # (uniform gray at brightness ~15 - renderer's untrained background Gaussians)
+        rgb_float = rgb_new.astype(np.float32)
+        brightness = rgb_float.mean(axis=2)
+        max_ch = rgb_float.max(axis=2)
+        min_ch = rgb_float.min(axis=2)
+        channel_diff = max_ch - min_ch
+        is_uniform_dark = (brightness < 25) & (channel_diff < 12)
+        depth_np[is_uniform_dark] = 0
+        
+        zero_mask = (depth_np == 0)
 
         depth_smoother = (128, 64, 64)
         depth_np = cv2.bilateralFilter(depth_np, depth_smoother[0], depth_smoother[1], depth_smoother[2])
-        
-        # close_depth = np.percentile(depth_np[depth_np!=0], 5)
-        # inf_depth = np.percentile(depth_np, 95)
-        # depth_np = np.clip(depth_np, close_depth, inf_depth)
 
         valid_depth = depth_np[depth_np != 0]
 
         if valid_depth.size == 0:
-            print(f"Warning: Frame has completely empty depth map. Skipping point cloud calculation for this frame.")
+            print(f"Warning: Frame {i_frame} has completely empty depth map. Skipping.")
             continue
-        
+
         close_depth = np.percentile(valid_depth, 5)
         inf_depth = np.percentile(depth_np, 95)
         depth_np = np.clip(depth_np, close_depth, inf_depth)
+        depth_np[zero_mask] = 0
 
         rgb_im = o3d.geometry.Image(rgb_new.astype(np.uint8))
         depth_im = o3d.geometry.Image(depth_np)
         rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(rgb_im, depth_im, convert_rgb_to_intensity=False)
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd_image,
-            o3d.camera.PinholeCameraIntrinsic(width, height, focal_x, focal_y, width / 2, width / 2),
+            o3d.camera.PinholeCameraIntrinsic(width, height, focal_x, focal_y, width / 2, height / 2),
             project_valid_depth_only=True
         )
+
         o3d.io.write_point_cloud(os.path.join(output_frame_folder, 'frame_{}.ply'.format(i_frame)), pcd)
 
 if __name__ == "__main__":

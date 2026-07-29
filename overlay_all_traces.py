@@ -177,8 +177,8 @@ def main():
                     print(f"Frame {i} - Matched flim_val: {flim_val} at index {index}")
                     max_cancer_detection_index = index
         
-        hue = 120.0 / 360.0  # Green (120 degrees converted to 0.0-1.0 scale)
-        saturation = SATURATION_SCALE[max_cancer_detection_index] #apply cancer detection index to saturation of curr point
+        hue = SATURATION_SCALE[max_cancer_detection_index] / 3.0 #trying out hue change instead of saturation for now, red to green
+        saturation = 1.0
         brightness = 1.0     #brightness
 
         marker_color_rgb = hsb_to_rgb(hue, saturation, brightness)

@@ -116,6 +116,7 @@ class EndoNeRF_Dataset(object):
 
         print(f"number of images: {len(self.image_paths)}")
         print("Number of poses:", poses.shape[0])
+        print("Number of depth images:", len(self.depth_paths))
 
         assert len(self.image_paths) == poses.shape[0], "the number of images should equal to the number of poses"
         assert len(self.depth_paths) == poses.shape[0], "the number of depth images should equal to number of poses"
