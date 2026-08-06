@@ -1,6 +1,7 @@
 ModelParams = dict(
     extra_mark = 'endonerf',
-    camera_extent = 10
+    camera_extent = 10,
+    endo_downsample=2.0
 )
 
 OptimizationParams = dict(

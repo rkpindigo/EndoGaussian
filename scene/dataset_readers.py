@@ -191,12 +191,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            ply_path=ply_path)
     return scene_info
 
-def readEndoNeRFInfo(datadir, mode):
+def readEndoNeRFInfo(datadir, mode, downsample=1.0):
     # load camera infos
     from scene.endo_loader import EndoNeRF_Dataset
     endo_dataset = EndoNeRF_Dataset(
         datadir=datadir,
-        downsample=1.0,
+        downsample=downsample,
         mode=mode
     )
     train_cam_infos = endo_dataset.format_infos(split="train")

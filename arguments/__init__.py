@@ -60,6 +60,7 @@ class ModelParams(ParamGroup):
         self.mode = 'binocular'
         self.no_fine = False
         self.init_pts = 200_000
+        self.endo_downsample = 1.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

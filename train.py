@@ -146,19 +146,36 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             gt_depths[gt_depths!=0] = 1 / gt_depths[gt_depths!=0]
             depth_loss = l1_loss(rendered_depths, gt_depths, masks)
         elif scene.mode == 'monocular':
-            rendered_depths_reshape = rendered_depths.reshape(-1, 1)
-            gt_depths_reshape = gt_depths.reshape(-1, 1)
-            mask_tmp = mask.reshape(-1)
-            rendered_depths_reshape, gt_depths_reshape = rendered_depths_reshape[mask_tmp!=0, :], gt_depths_reshape[mask_tmp!=0, :]
-            depth_loss =  0.001 * (1 - pearson_corrcoef(gt_depths_reshape, rendered_depths_reshape))
+            mask_tmp = masks.reshape(-1).bool()
+            rendered_flat = rendered_depths.reshape(-1)[mask_tmp]
+            gt_flat = gt_depths.reshape(-1)[mask_tmp]
+            #scale-shift invariant L1: normalize both to zero mean, unit variance
+            r_mean, r_std = rendered_flat.mean(), rendered_flat.std() + 1e-6
+            g_mean, g_std = gt_flat.mean(), gt_flat.std() + 1e-6
+            rendered_norm = (rendered_flat - r_mean) / r_std
+            gt_norm = (gt_flat - g_mean) / g_std
+            depth_loss = 0.01 * torch.abs(rendered_norm - gt_norm).mean()
         else:
             raise ValueError(f"{scene.mode} is not implemented.")
+
+        #edge-aware depth smoothness: penalize depth gradients except at image edges
+        _d = rendered_depths if rendered_depths.dim() == 4 else rendered_depths.unsqueeze(1)
+        #normalize depth for smoothness/TV to prevent loss explosion
+        _d_max = _d.max().clamp(min=1e-6)
+        _d_norm = _d / _d_max
+        img_grad_x = torch.abs(rendered_images[:,:,:,1:] - rendered_images[:,:,:,:-1]).mean(dim=1, keepdim=True)
+        img_grad_y = torch.abs(rendered_images[:,:,1:,:] - rendered_images[:,:,:-1,:]).mean(dim=1, keepdim=True)
+        #depth smoothness: penalize large depth gradients to prevent radial bias
+        depth_grad_x = torch.abs(_d_norm[:,:,:,1:] - _d_norm[:,:,:,:-1])
+        depth_grad_y = torch.abs(_d_norm[:,:,1:,:] - _d_norm[:,:,:-1,:])
+        depth_smooth_loss = depth_grad_x.mean() + depth_grad_y.mean()
+
         
-        depth_tvloss = TV_loss(rendered_depths)
+        depth_tvloss = TV_loss(_d_norm)
         img_tvloss = TV_loss(rendered_images)
         tv_loss = 0.03 * (img_tvloss + depth_tvloss)
         
-        loss = Ll1 + depth_loss + tv_loss
+        loss = Ll1 + depth_loss + tv_loss + 0.05
 
         psnr_ = psnr(rendered_images, gt_images, masks).mean().double()        
         
@@ -174,13 +191,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         
         if gaussians.get_xyz.shape[0] == 0:
             print(f"Warning: Step {iteration} has 0 active Gaussians. Skipping backward pass to prevent CUDA overflow.")
-            #assign dummy loss or just clear optimizer gradients to safely skip
+            gaussians.optimizer.zero_grad(set_to_none=True)
+        elif torch.isnan(loss) or torch.isinf(loss) or loss.item() > 1e6:
+            print(f"[ITER {iteration}] Bad loss ({loss.item():.2e})! "
+                    f"Ll1={Ll1.item():.2e}, depth={depth_loss.item():.2e}, "
+                    f"tv={tv_loss.item():.2e}, smooth={depth_smooth_loss.item():.2e}. Skipping.")
             gaussians.optimizer.zero_grad(set_to_none=True)
         else:
-            #run backward pass only if we have active points
             loss.backward()
-            
-            #apply gradient clipping safety net
             torch.nn.utils.clip_grad_norm_(gaussians.optimizer.param_groups[0]['params'], max_norm=1.0)
 
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
@@ -219,9 +237,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     render_training_image(scene, gaussians, video_cams, render, pipe, background, stage, iteration-1,timer.get_elapsed_time())
             timer.start()
             
-            # Densification
+            #densification
             if iteration < opt.densify_until_iter :
-                # Keep track of max radii in image-space for pruning
+                #keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor_grad, visibility_filter)
 
@@ -234,7 +252,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
+                    if gaussians._xyz.shape[0] < 2000000:
+                        gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, max_gaussians=2000000)
+                    else:
+                        print(f"[ITER {iteration}] Point cap reached ({gaussians._xyz.shape[0]}), skipping densify")
                     
                 if iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0:
                     size_threshold = 40 if iteration > opt.opacity_reset_interval else None

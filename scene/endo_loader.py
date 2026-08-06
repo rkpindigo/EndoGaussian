@@ -142,7 +142,10 @@ class EndoNeRF_Dataset(object):
                 inf_depth = np.percentile(depth[depth!=0], 99.8)
                 depth = np.clip(depth, close_depth, inf_depth)
             elif self.mode == 'monocular':
-                depth = np.array(Image.open(self.depth_paths[idx]))[...,0] / 255.0
+                depth = np.array(Image.open(self.depth_paths[idx]))
+                if depth.ndim == 3:
+                    depth = depth[..., 0]
+                depth = depth / 255.0
                 depth[depth!=0] = (1 / depth[depth!=0])*0.4
                 depth[depth==0] = depth.max()
                 depth = depth[...,None]
@@ -214,7 +217,10 @@ class EndoNeRF_Dataset(object):
             inf_depth = np.percentile(depth[depth!=0], 99.8)
             depth = np.clip(depth, close_depth, inf_depth)
         else:
-            depth = np.array(Image.open(self.depth_paths[idx]))[..., 0] / 255.0
+            depth = np.array(Image.open(self.depth_paths[idx]))
+            if depth.ndim == 3:
+                depth = depth[..., 0]
+            depth = depth / 255.0
             depth[depth!=0] = (1 / depth[depth!=0])*0.4
             depth[depth==0] = depth.max()
 

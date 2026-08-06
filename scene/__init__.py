@@ -39,7 +39,7 @@ class Scene:
         if os.path.exists(os.path.join(args.source_path, "sparse")) and args.extra_mark is None:
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")) and args.extra_mark == 'endonerf':
-            scene_info = sceneLoadTypeCallbacks["endonerf"](args.source_path, mode=args.mode)
+            scene_info = sceneLoadTypeCallbacks["endonerf"](args.source_path, mode=args.mode, downsample=args.endo_downsample)
             print("Found poses_bounds.py and extra marks with EndoNeRf")
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")) and args.extra_mark == 'hamlyn':
             scene_info = sceneLoadTypeCallbacks["hamlyn"](args.source_path, mode=args.mode)
@@ -76,10 +76,7 @@ class Scene:
                                                     iteration_str,
                                                    ))
         else:
-            if args.extra_mark == 'endonerf':
-                self.gaussians.create_from_pcd(scene_info.point_cloud, args.camera_extent, self.maxtime)
-            else:
-                self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, self.maxtime)
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, self.maxtime)
 
     def save(self, iteration, stage):
         if stage == "coarse":

@@ -188,7 +188,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             stage = 'coarse' if no_fine else 'fine'
             white_render = render(view, gaussians, pipeline, white_bg, stage=stage)
             white_images.append(white_render["render"].cpu())
-        reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name)
+        reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name, masks=mask_list)
 
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, reconstruct: bool):
     
@@ -209,7 +209,7 @@ def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : P
         if not skip_video:
             render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, dataset.no_fine, render_test=True, reconstruct=reconstruct)
 
-def reconstruct_point_cloud(black_images, white_images, depths, camera_parameters, name, alpha_threshold=0.5):
+def reconstruct_point_cloud(black_images, white_images, depths, camera_parameters, name, alpha_threshold=0.5, masks=None):
     import cv2
     import copy
     output_frame_folder = os.path.join("reconstruct", name)
@@ -245,7 +245,18 @@ def reconstruct_point_cloud(black_images, white_images, depths, camera_parameter
         channel_diff = max_ch - min_ch
         is_uniform_dark = (brightness < 25) & (channel_diff < 12)
         depth_np[is_uniform_dark] = 0
-        
+
+        # Zero out depth wherever the tool mask excludes this pixel from training --
+        # Gaussians covering a masked-out region receive no photometric/depth
+        # supervision at all, so they're free to drift to arbitrary positions
+        # (this is the source of the "folded flap" floater artifacts).
+        if masks is not None:
+            mask_np = masks[i_frame]
+            if hasattr(mask_np, "cpu"):
+                mask_np = mask_np.cpu().numpy()
+            mask_np = np.squeeze(mask_np)
+            depth_np[mask_np == 0] = 0
+
         zero_mask = (depth_np == 0)
 
         depth_smoother = (128, 64, 64)

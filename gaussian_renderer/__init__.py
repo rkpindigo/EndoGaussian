@@ -75,9 +75,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if stage == "coarse" :
         means3D_deform, scales_deform, rotations_deform, opacity_deform = means3D, scales, rotations, opacity
     else:
-        means3D_deform, scales_deform, rotations_deform, opacity_deform = pc._deformation(means3D[deformation_point], scales[deformation_point], 
+        means3D_deform, scales_deform, rotations_deform, opacity_deform = pc._deformation(means3D[deformation_point], scales[deformation_point],
                                                                          rotations[deformation_point], opacity[deformation_point],
                                                                          time[deformation_point])
+        
+        # Clamp deformation outputs to prevent illegal memory access in rasterizer
+        means3D_deform = torch.clamp(means3D_deform, -1e3, 1e3)
+        scales_deform = torch.clamp(scales_deform, -20.0, 20.0)
+        rotations_deform = torch.clamp(rotations_deform, -2.0, 2.0)
+        opacity_deform = torch.clamp(opacity_deform, -20.0, 20.0)
     # print(time.max())
     with torch.no_grad():
         pc._deformation_accum[deformation_point] += torch.abs(means3D_deform - means3D[deformation_point])
