@@ -48,7 +48,7 @@ class EndoNeRF_Dataset(object):
     def __init__(
         self,
         datadir,
-        downsample=1.0,
+        downsample=2.0, #changed from 1.0 to 2.0 to account for lower image resolution
         test_every=8,
         mode='binocular'
     ):

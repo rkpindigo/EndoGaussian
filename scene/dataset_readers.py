@@ -196,7 +196,7 @@ def readEndoNeRFInfo(datadir, mode):
     from scene.endo_loader import EndoNeRF_Dataset
     endo_dataset = EndoNeRF_Dataset(
         datadir=datadir,
-        downsample=1.0,
+        downsample=2.0, #changed from 1.0 to 2.0 to account for lower image resolution
         mode=mode
     )
     train_cam_infos = endo_dataset.format_infos(split="train")
