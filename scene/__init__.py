@@ -10,6 +10,7 @@
 #
 
 import os
+import numpy as np
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -39,7 +40,7 @@ class Scene:
         if os.path.exists(os.path.join(args.source_path, "sparse")) and args.extra_mark is None:
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")) and args.extra_mark == 'endonerf':
-            scene_info = sceneLoadTypeCallbacks["endonerf"](args.source_path, mode=args.mode, downsample=args.endo_downsample)
+            scene_info = sceneLoadTypeCallbacks["endonerf"](args.source_path, mode=args.mode, downsample=getattr(args, "endo_downsample", 1.0))
             print("Found poses_bounds.py and extra marks with EndoNeRf")
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")) and args.extra_mark == 'hamlyn':
             scene_info = sceneLoadTypeCallbacks["hamlyn"](args.source_path, mode=args.mode)
@@ -52,6 +53,21 @@ class Scene:
         
         self.maxtime = scene_info.maxtime
         self.cameras_extent = scene_info.nerf_normalization["radius"]
+        if self.cameras_extent < 1e-6:
+            # Degenerate under static/identity poses -- every camera center is
+            # identical, so the camera-spread-based radius (diagonal * 1.1 in
+            # getNerfppNorm) is exactly zero. spatial_lr_scale (set from this
+            # value in create_from_pcd) directly multiplies the position/
+            # deformation/grid learning rates in training_setup(), so a zero
+            # here silently freezes all of them for the entire training run --
+            # this is what caused the flat-plane collapse on static-pose scenes.
+            # Fall back to a point-cloud-derived scale instead, which stays
+            # well-defined regardless of camera motion.
+            pts = scene_info.point_cloud.points
+            fallback_extent = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)) / 2.0)
+            print(f"self.cameras_extent computed as {self.cameras_extent} (degenerate, likely static poses) "
+                  f"-- falling back to point-cloud-derived extent {fallback_extent}")
+            self.cameras_extent = fallback_extent
         print("self.cameras_extent is ", self.cameras_extent)
 
         print("Loading Training Cameras")
