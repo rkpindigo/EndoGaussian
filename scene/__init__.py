@@ -63,8 +63,21 @@ class Scene:
             # this is what caused the flat-plane collapse on static-pose scenes.
             # Fall back to a point-cloud-derived scale instead, which stays
             # well-defined regardless of camera motion.
+            # Use a percentile of per-point distance-from-centroid rather than a
+            # per-axis min/max (or per-axis percentile) bounding box. The initial
+            # point cloud comes from unprojecting depth through a 1/x disparity
+            # inversion (see scene/endo_loader.py) combined with a MULTIPLICATIVE
+            # per-pixel factor (X = (u-cx)/fx * depth, Y = (v-cy)/fy * depth) --
+            # a pixel near the frame edge combined with only a moderately elevated
+            # depth (not an outlier on its own) can still land far from the scene
+            # center once position and depth compound. Per-axis clipping doesn't
+            # catch that, since such a point can be within-range on each axis
+            # independently while still being unusually far away jointly. A
+            # single combined per-point radius avoids that.
             pts = scene_info.point_cloud.points
-            fallback_extent = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)) / 2.0)
+            centroid = np.median(pts, axis=0)
+            radii = np.linalg.norm(pts - centroid, axis=1)
+            fallback_extent = float(np.percentile(radii, 90))
             print(f"self.cameras_extent computed as {self.cameras_extent} (degenerate, likely static poses) "
                   f"-- falling back to point-cloud-derived extent {fallback_extent}")
             self.cameras_extent = fallback_extent

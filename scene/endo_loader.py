@@ -52,10 +52,6 @@ class EndoNeRF_Dataset(object):
         test_every=8,
         mode='binocular'
     ):
-        self.img_wh = (
-            int(1280 / downsample),
-            int(720 / downsample),
-        )
         self.root_dir = datadir
         self.downsample = downsample 
         self.blender2opencv = np.eye(4)
@@ -82,6 +78,11 @@ class EndoNeRF_Dataset(object):
         poses = poses_arr[:, :-2].reshape([-1, 3, 5])  # (N_cams, 3, 5)
         # coordinate transformation OpenGL->Colmap, center poses
         H, W, focal = poses[0, :, -1]
+        # Native resolution comes from the scene's own poses_bounds.npy, not a
+        # hardcoded assumption -- different scenes can have different aspect
+        # ratios (e.g. 1280x1024 vs 1280x720), and img_wh needs to track
+        # whichever one this specific scene actually is.
+        self.img_wh = (int(W / self.downsample), int(H / self.downsample))
         focal = focal / self.downsample
         self.focal = (focal, focal)
         self.K = np.array([[focal, 0 , W//2],
