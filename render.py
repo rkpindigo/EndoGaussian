@@ -194,8 +194,20 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             white_render = render(view, gaussians, pipeline, white_bg, stage=stage)
             white_images.append(white_render["render"].cpu())
         world_view_transforms = [view.world_view_transform.cpu().numpy() for view in views]
-        #keep masks=mask_list for enabling masks, change to masks=None for disabling masks
-        #reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name, masks=mask_list, world_view_transforms=world_view_transforms, temporal_fill_radius=0)
+        # Reverted to masks=None after testing masks=mask_list (hole-filling: masked-out tool
+        # pixels backfilled by reprojecting nearby-in-time frames' observed geometry) on P105/run8
+        # -- tried temporal_fill_radius=30 (default) then 3, then tightened _bilateral_clip's
+        # sigmaColor from a fixed 64 down to a scale-aware 30%-of-range, then 10%-of-range (see
+        # _bilateral_clip's docstring). Each fix measurably reduced distortion but never
+        # eliminated a "shattered into fan-like shards" artifact at tool sites, or in the latest
+        # (10%) attempt, coherent-but-wrong-position geometry (tools moved/jutting instead of
+        # melded). Root cause assessed as monocular depth (DA3, single-view estimate) lacking the
+        # cross-frame geometric consistency hole-filling needs -- filtering can reduce noise but
+        # can't manufacture agreement between frames that isn't there. masks=None gives a
+        # geometrically-wrong-but-visually-coherent result (tool melded into tissue) instead;
+        # revisit masks=mask_list for scenes with real triangulated (e.g. stereo) depth, where the
+        # cross-frame consistency this relies on is more likely to actually hold.
+        #reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name, masks=mask_list, world_view_transforms=world_view_transforms, temporal_fill_radius=3, frame_uids=frame_uids)
         reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name, masks=None, world_view_transforms=world_view_transforms, frame_uids=frame_uids)
 
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, reconstruct: bool):
@@ -248,10 +260,31 @@ def _reproject_from_world(world_pts, wvt, focal_x, focal_y, width, height):
 def _bilateral_clip(depth_np):
     """Same bilateral-filter + percentile-clip cleanup the original per-frame pipeline always
     did -- given a depth map with holes (if any) already zeroed. Runs on ONE frame's own depth
-    only, so it never gets influenced by what's happening in a different frame's fill-in."""
+    only, so it never gets influenced by what's happening in a different frame's fill-in.
+
+    sigmaColor is derived from THIS FRAME'S OWN valid-depth range rather than a fixed absolute
+    constant (was 64) -- that fixed value was implicitly tuned for the stereo scenes' depth
+    units (range ~40-245). It silently breaks for any scene with a very different depth scale:
+    confirmed on P105/run8 (monocular, real depth range only ~0.06-0.75) that sigmaColor=64 is
+    ~90x the entire depth span, degenerating the filter into a near-unweighted spatial blur with
+    zero edge preservation, corrupting the geometry that then gets reprojected into other frames
+    during hole-filling (the "shattered into fan-like shards" artifact -- and why cutting
+    temporal_fill_radius 30->3 didn't help: every reprojection source was equally corrupted,
+    regardless of how close in time).
+
+    Ratio tightened from an initial 30% (a first guess at the stereo scenes' implicit ratio) to
+    10%, after confirming empirically that the shatter artifact was still visible on P105/run8 at
+    30% -- measured max per-pixel depth shift on one frame: 0.207 at 30% vs. 0.099 at 10% (on a
+    depth span of 0.59), roughly halving the residual distortion. Going much tighter than this
+    starts to defeat the filter's actual denoising purpose (nearly every depth difference would
+    exceed sigmaColor and get preserved as an "edge" rather than smoothed).
+    """
     import cv2
     zero_mask = (depth_np == 0)
-    depth_smoother = (128, 64, 64)
+    valid_for_scale = depth_np[~zero_mask]
+    depth_range = float(valid_for_scale.max() - valid_for_scale.min()) if valid_for_scale.size > 0 else 0.0
+    sigma_color = max(depth_range * 0.1, 1e-6)
+    depth_smoother = (128, sigma_color, 64)
     out = cv2.bilateralFilter(depth_np, depth_smoother[0], depth_smoother[1], depth_smoother[2])
     valid_depth = out[out != 0]
     if valid_depth.size == 0:
