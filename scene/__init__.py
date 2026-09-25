@@ -53,6 +53,23 @@ class Scene:
         
         self.maxtime = scene_info.maxtime
         self.cameras_extent = scene_info.nerf_normalization["radius"]
+        # Point-cloud-derived extent, used both as a degenerate-camera-motion fallback
+        # and as a floor on the camera-motion-derived value (see below). Use a
+        # percentile of per-point distance-from-centroid rather than a per-axis
+        # min/max (or per-axis percentile) bounding box. The initial point cloud comes
+        # from unprojecting depth through a 1/x disparity inversion (see
+        # scene/endo_loader.py) combined with a MULTIPLICATIVE per-pixel factor
+        # (X = (u-cx)/fx * depth, Y = (v-cy)/fy * depth) -- a pixel near the frame edge
+        # combined with only a moderately elevated depth (not an outlier on its own)
+        # can still land far from the scene center once position and depth compound.
+        # Per-axis clipping doesn't catch that, since such a point can be within-range
+        # on each axis independently while still being unusually far away jointly. A
+        # single combined per-point radius avoids that.
+        pts = scene_info.point_cloud.points
+        centroid = np.median(pts, axis=0)
+        radii = np.linalg.norm(pts - centroid, axis=1)
+        pointcloud_extent = float(np.percentile(radii, 90))
+
         if self.cameras_extent < 1e-6:
             # Degenerate under static/identity poses -- every camera center is
             # identical, so the camera-spread-based radius (diagonal * 1.1 in
@@ -61,26 +78,27 @@ class Scene:
             # deformation/grid learning rates in training_setup(), so a zero
             # here silently freezes all of them for the entire training run --
             # this is what caused the flat-plane collapse on static-pose scenes.
-            # Fall back to a point-cloud-derived scale instead, which stays
-            # well-defined regardless of camera motion.
-            # Use a percentile of per-point distance-from-centroid rather than a
-            # per-axis min/max (or per-axis percentile) bounding box. The initial
-            # point cloud comes from unprojecting depth through a 1/x disparity
-            # inversion (see scene/endo_loader.py) combined with a MULTIPLICATIVE
-            # per-pixel factor (X = (u-cx)/fx * depth, Y = (v-cy)/fy * depth) --
-            # a pixel near the frame edge combined with only a moderately elevated
-            # depth (not an outlier on its own) can still land far from the scene
-            # center once position and depth compound. Per-axis clipping doesn't
-            # catch that, since such a point can be within-range on each axis
-            # independently while still being unusually far away jointly. A
-            # single combined per-point radius avoids that.
-            pts = scene_info.point_cloud.points
-            centroid = np.median(pts, axis=0)
-            radii = np.linalg.norm(pts - centroid, axis=1)
-            fallback_extent = float(np.percentile(radii, 90))
             print(f"self.cameras_extent computed as {self.cameras_extent} (degenerate, likely static poses) "
-                  f"-- falling back to point-cloud-derived extent {fallback_extent}")
-            self.cameras_extent = fallback_extent
+                  f"-- falling back to point-cloud-derived extent {pointcloud_extent}")
+            self.cameras_extent = pointcloud_extent
+        elif self.cameras_extent < pointcloud_extent:
+            # Non-degenerate but still too small: cameras_extent only reflects how far
+            # the CAMERA physically moved, which is unrelated to how large the visible
+            # GEOMETRY is. For a scene where the camera translates very little while
+            # looking across a large depth range (e.g. a near-static endoscope), camera
+            # motion can be a small fraction of the true scene scale. This matters
+            # because cameras_extent is used as a stand-in for scene scale in more than
+            # just the LR scaling: GaussianModel.prune() (scene/gaussian_model.py)
+            # removes any Gaussian whose scale exceeds 0.1*extent once
+            # iteration > opacity_reset_interval -- with too-small extent, that
+            # threshold is far tighter than the geometry actually needs, causing mass
+            # pruning right at the reset boundary (confirmed: 11698 -> 621 Gaussians
+            # between iterations 3000 and 4000 on this scene). Floor cameras_extent at
+            # the point-cloud extent so it never under-represents the real scene size.
+            print(f"self.cameras_extent computed as {self.cameras_extent} from camera motion, which is smaller "
+                  f"than the point-cloud extent {pointcloud_extent} -- flooring to the latter so scale-dependent "
+                  f"thresholds (prune size, spatial_lr_scale) reflect the true scene size, not just camera travel.")
+            self.cameras_extent = pointcloud_extent
         print("self.cameras_extent is ", self.cameras_extent)
 
         print("Loading Training Cameras")

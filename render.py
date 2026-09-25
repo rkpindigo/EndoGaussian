@@ -87,7 +87,7 @@ def export_gaussian_tissue_point_cloud(gaussians, views, model_path, name, itera
     
     print("Done with reconstructions")
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, no_fine, render_test=True, reconstruct=False):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, no_fine, render_test=False, reconstruct=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -105,14 +105,17 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     gt_list = []
     gt_depths = []
     mask_list = []
+    frame_uids = []  # each view's TRUE original-video frame number (view.uid) -- for train/test
+                      # splits this is NOT the same as that view's position within `views`
+                      # (train/test are a sparse subset of the full frame range; only the
+                      # "video" split's positions happen to equal true frame numbers)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         stage = 'coarse' if no_fine else 'fine'
         rendering = render(view, gaussians, pipeline, background, stage=stage)
-        for i in range(len(render_depths)):
-            print(i, render_depths[i].min().item(), render_depths[i].max().item(), render_depths[i].mean().item())
         render_depths.append(rendering["depth"].cpu())
         render_images.append(rendering["render"].cpu())
+        frame_uids.append(int(view.uid))
         if name in ["train", "test", "video"]:
             gt = view.original_image[0:3, :, :]
             gt_list.append(gt)
@@ -192,8 +195,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             white_images.append(white_render["render"].cpu())
         world_view_transforms = [view.world_view_transform.cpu().numpy() for view in views]
         #keep masks=mask_list for enabling masks, change to masks=None for disabling masks
-        reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name, masks=mask_list, world_view_transforms=world_view_transforms)
-        #reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name, masks=None, world_view_transforms=world_view_transforms)
+        #reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name, masks=mask_list, world_view_transforms=world_view_transforms, temporal_fill_radius=0)
+        reconstruct_point_cloud(render_images, white_images, render_depths, camera_parameters, name, masks=None, world_view_transforms=world_view_transforms, frame_uids=frame_uids)
 
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool, reconstruct: bool):
     
@@ -210,9 +213,9 @@ def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : P
         if not skip_train:
             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.no_fine, reconstruct=reconstruct)
         if not skip_test:
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.no_fine, render_test=True, reconstruct=reconstruct)
+            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.no_fine, reconstruct=reconstruct)
         if not skip_video:
-            render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, dataset.no_fine, render_test=True, reconstruct=reconstruct)
+            render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, dataset.no_fine, reconstruct=reconstruct)
 
 def _unproject_to_world(depth, valid_mask, wvt, focal_x, focal_y, width, height):
     """depth: (H,W). valid_mask: (H,W) bool. wvt: (4,4) world_view_transform (world->camera,
@@ -260,7 +263,7 @@ def _bilateral_clip(depth_np):
     return out, True
 
 
-def reconstruct_point_cloud(black_images, white_images, depths, camera_parameters, name, alpha_threshold=0.5, masks=None, world_view_transforms=None, temporal_fill_radius=30):
+def reconstruct_point_cloud(black_images, white_images, depths, camera_parameters, name, alpha_threshold=0.5, masks=None, world_view_transforms=None, temporal_fill_radius=30, frame_uids=None):
     import copy
     output_frame_folder = os.path.join("reconstruct", name)
     os.makedirs(output_frame_folder, exist_ok=True)
@@ -332,6 +335,10 @@ def reconstruct_point_cloud(black_images, white_images, depths, camera_parameter
             world_points.append(None)
             world_colors.append(None)
 
+    saved_depths = []       # final, fully-cleaned+filled depth actually used per exported ply
+    saved_wvts = []          # world_view_transform actually used per exported ply
+    saved_frame_idxs = []    # position used in this ply's filename (frame_<this>.ply)
+    saved_frame_uids = []    # TRUE original-video frame number for that same ply (see frame_uids)
     for i_frame in frames:
         depth_np = masked_depths[i_frame].copy()
         rgb_new = cleaned_rgbs[i_frame].copy()
@@ -411,6 +418,32 @@ def reconstruct_point_cloud(black_images, white_images, depths, camera_parameter
         )
 
         o3d.io.write_point_cloud(os.path.join(output_frame_folder, 'frame_{}.ply'.format(i_frame)), pcd)
+
+        if world_view_transforms is not None:
+            saved_depths.append(depth_np)
+            saved_wvts.append(world_view_transforms[i_frame])
+            saved_frame_idxs.append(i_frame)
+            saved_frame_uids.append(frame_uids[i_frame] if frame_uids is not None else i_frame)
+
+    # Persist the exact depth + pose used to build each exported ply, so downstream tools (e.g.
+    # overlay_tracks.py's FLIm back-projection) can look up the model's true depth at an
+    # arbitrary tracked pixel without having to reload the GaussianModel and re-render, and
+    # without having to re-derive the same alpha/mask/bilateral cleaning done above.
+    #
+    # frame_indices.npy holds the POSITION used in each ply's filename (frame_<this>.ply);
+    # frame_uids.npy holds the TRUE original-video frame number for that same ply. These are
+    # THE SAME for the "video" split (video_idxs = range(n_frames), so position == true frame
+    # number) but DIFFER for "train"/"test" (a sparse, non-contiguous subset of frames -- e.g.
+    # test_idxs keeps every 8th frame, so position 3 in the test split might be true frame 25).
+    # Anything indexing into a CoTracker/FLIm track array (which is indexed by true video frame
+    # number) must use frame_uids.npy, not frame_indices.npy.
+    if saved_depths:
+        np.save(os.path.join(output_frame_folder, "depths.npy"), np.stack(saved_depths))
+        np.save(os.path.join(output_frame_folder, "world_view_transforms.npy"), np.stack(saved_wvts))
+        np.save(os.path.join(output_frame_folder, "frame_indices.npy"), np.array(saved_frame_idxs))
+        np.save(os.path.join(output_frame_folder, "frame_uids.npy"), np.array(saved_frame_uids))
+        np.save(os.path.join(output_frame_folder, "camera_params.npy"),
+                np.array([focal_x, focal_y, width, height]))
 
 if __name__ == "__main__":
     import psutil

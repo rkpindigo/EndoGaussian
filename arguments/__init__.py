@@ -136,6 +136,10 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold_coarse = 0.0002
         self.densify_grad_threshold_fine_init = 0.0002
         self.densify_grad_threshold_after = 0.0002
+        self.max_gaussians = 2_000_000  # matches train.py's prior hardcoded densify() cap --
+                                         # exposed here so a scene prone to runaway densification
+                                         # (e.g. after raising position/deformation LR) can set a
+                                         # tighter, GPU-memory-safe cap without affecting others.
         self.pruning_from_iter = 500
         self.pruning_interval = 100
         self.opacity_threshold_coarse = 0.005

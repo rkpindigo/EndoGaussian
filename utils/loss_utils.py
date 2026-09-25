@@ -22,8 +22,24 @@ def TV_loss(x):
     return (tv_h + tv_w) / (B * C * H * W)
 
 
-def lpips_loss(img1, img2, lpips_model):
-    loss = lpips_model(img1,img2)
+def lpips_loss(img1, img2, lpips_model, mask=None):
+    """img1/img2 expected in [0,1] (normalize=True rescales internally to the [-1,1] LPIPS
+    expects -- the previous unmasked call omitted this, silently feeding [0,1] images into a
+    function that assumed [-1,1]).
+
+    mask (optional): same (B,1,H,W) tensor/convention passed to l1_loss (1=included, 0=excluded).
+    Requires lpips_model to have been constructed with spatial=True, so it returns a (B,1,H,W)
+    per-pixel distance map instead of a single scalar. Averaging that map only over mask-valid
+    locations mirrors l1_loss's own exclusion semantics -- without this, LPIPS pressures the
+    model to reproduce masked-out ground truth (e.g. a tool the mask exists specifically to
+    exclude), directly fighting the L1/depth losses that deliberately ignore that same region.
+    """
+    loss = lpips_model(img1, img2, normalize=True)
+    if mask is not None:
+        valid = mask != 0
+        if valid.any():
+            return loss[valid].mean()
+        return loss.sum() * 0.0
     return loss.mean()
 
 def l1_loss(network_output, gt, mask=None):

@@ -98,7 +98,15 @@ class Deformation(nn.Module):
         return parameter_list
     
     def get_grid_parameters(self):
-        return list(self.grid.parameters()) 
+        # Exclude aabb: scene/__init__.py's set_aabb() sets it from the real point
+        # cloud extent (a fixed hyperparameter, not something that should be learned --
+        # standard treatment for K-Planes/HexPlane-style scene bounds). It's a plain
+        # nn.Parameter with requires_grad=True and no clamp, so leaving it in this
+        # optimizer group lets gradient descent shrink (aabb[1]-aabb[0]) toward zero on
+        # any axis; normalize_aabb's 2.0/(aabb[1]-aabb[0]) then blows up, and that value
+        # multiplying into the point coordinates is what produced
+        # "MulBackward0 returned nan values in its 0th output" during fine-stage training.
+        return [p for name, p in self.grid.named_parameters() if name != "aabb"]
 
 class deform_network(nn.Module):
     def __init__(self, args) :

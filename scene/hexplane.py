@@ -151,7 +151,13 @@ class HexPlaneField(nn.Module):
             xyz_max,
             xyz_min
         ])
-        self.aabb = nn.Parameter(aabb,requires_grad=True) # !!!!!
+        # requires_grad=False: this is a fixed hyperparameter (the real point cloud
+        # extent, set once from scene/__init__.py) defining normalize_aabb's coordinate
+        # domain, not something that should be learned. get_grid_parameters() in
+        # scene/deformation.py already excludes it from the optimizer, but leaving this
+        # True would still make autograd compute an unused gradient for it every
+        # iteration for no reason.
+        self.aabb = nn.Parameter(aabb, requires_grad=False)
         print("Voxel Plane: set aabb=",self.aabb)
 
     def get_density(self, pts: torch.Tensor, timestamps: Optional[torch.Tensor] = None):

@@ -61,7 +61,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     progress_bar = tqdm(range(first_iter, final_iter), desc="Training progress")
     first_iter += 1
     
-    lpips_model = lpips.LPIPS(net="vgg").cuda()
+    lpips_model = lpips.LPIPS(net="vgg", spatial=True).cuda()  # spatial=True: per-pixel map, so
+    # lpips_loss can mask out excluded (e.g. tool) regions the same way l1_loss/depth_loss do
     video_cams = scene.getVideoCameras()
     
     if not viewpoint_stack:
@@ -174,6 +175,23 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         depth_tvloss = TV_loss(_d_norm)
         img_tvloss = TV_loss(rendered_images)
         tv_loss = 0.03 * (img_tvloss + depth_tvloss)
+
+        if (torch.isnan(tv_loss) or torch.isinf(tv_loss)) and not globals().get("_tv_nan_dumped"):
+            globals()["_tv_nan_dumped"] = True
+            print(f"\n[ITER {iteration}] TV-NAN DIAGNOSTIC (one-time dump):")
+            print(f"  img_tvloss={img_tvloss.item()}, depth_tvloss={depth_tvloss.item()}")
+            print(f"  _d_max={_d_max.item()}, rendered_depths: isnan={torch.isnan(rendered_depths).any().item()}, "
+                  f"isinf={torch.isinf(rendered_depths).any().item()}, min={rendered_depths.min().item():.4g}, max={rendered_depths.max().item():.4g}")
+            mask_bool = masks.bool() if masks.dtype != torch.bool else masks
+            unmasked_d = rendered_depths[~mask_bool] if mask_bool.shape == rendered_depths.shape else None
+            if unmasked_d is not None and unmasked_d.numel() > 0:
+                print(f"  rendered_depths WITHIN masked-out region: isnan={torch.isnan(unmasked_d).any().item()}, "
+                      f"isinf={torch.isinf(unmasked_d).any().item()}, min={unmasked_d.min().item():.4g}, max={unmasked_d.max().item():.4g}")
+            masked_in_d = rendered_depths[mask_bool] if mask_bool.shape == rendered_depths.shape else None
+            if masked_in_d is not None and masked_in_d.numel() > 0:
+                print(f"  rendered_depths WITHIN masked-in region: isnan={torch.isnan(masked_in_d).any().item()}, "
+                      f"isinf={torch.isinf(masked_in_d).any().item()}, min={masked_in_d.min().item():.4g}, max={masked_in_d.max().item():.4g}")
+            print(f"  rendered_images: isnan={torch.isnan(rendered_images).any().item()}, isinf={torch.isinf(rendered_images).any().item()}")
         
         loss = Ll1 + depth_loss + tv_loss + 0.05
 
@@ -186,7 +204,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             ssim_loss = ssim(rendered_images,gt_images)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
         if opt.lambda_lpips !=0:
-            lpipsloss = lpips_loss(rendered_images,gt_images,lpips_model)
+            lpipsloss = lpips_loss(rendered_images,gt_images,lpips_model,masks)
             loss += opt.lambda_lpips * lpipsloss
         
         if gaussians.get_xyz.shape[0] == 0:
@@ -199,7 +217,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             gaussians.optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(gaussians.optimizer.param_groups[0]['params'], max_norm=1.0)
+            # NOTE: previously only clipped param_groups[0] (xyz). The deformation/grid
+            # parameter groups (param_groups[1:3], both LR-scaled by spatial_lr_scale ==
+            # cameras_extent) had no gradient-norm protection at all -- on a scene with a
+            # large real-world coordinate scale (ours), this let the HexPlane grid
+            # parameters explode to NaN within a few hundred fine-stage iterations, with
+            # compute_regulation() only surfacing the pre-existing NaN, not causing it.
+            for group in gaussians.optimizer.param_groups:
+                torch.nn.utils.clip_grad_norm_(group['params'], max_norm=1.0)
 
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
         for idx in range(0, len(viewspace_point_tensor_list)):
@@ -211,6 +236,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         iter_end.record()
 
         with torch.no_grad():
+            if stage == "fine" and iteration % 250 == 0:
+                op = gaussians.get_opacity
+                print(f"\n[ITER {iteration}] opacity stats: min={op.min().item():.4f} "
+                      f"median={op.median().item():.4f} mean={op.mean().item():.4f} max={op.max().item():.4f} "
+                      f"frac>0.1={ (op > 0.1).float().mean().item():.3f} frac>0.5={ (op > 0.5).float().mean().item():.3f}")
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_psnr_for_log = 0.4 * psnr_ + 0.6 * ema_psnr_for_log
@@ -240,7 +270,21 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             #densification
             if iteration < opt.densify_until_iter :
                 #keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                try:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                except RuntimeError:
+                    print(f"\n[ITER {iteration}] DIAGNOSTIC DUMP before re-raising:")
+                    print(f"  gaussians._xyz: shape={gaussians._xyz.shape}, "
+                          f"isnan={torch.isnan(gaussians._xyz).any().item()}, isinf={torch.isinf(gaussians._xyz).any().item()}, "
+                          f"min={gaussians._xyz.min().item():.4g}, max={gaussians._xyz.max().item():.4g}")
+                    scaling = gaussians.get_scaling
+                    print(f"  gaussians.get_scaling: isnan={torch.isnan(scaling).any().item()}, isinf={torch.isinf(scaling).any().item()}, "
+                          f"min={scaling.min().item():.4g}, max={scaling.max().item():.4g}")
+                    print(f"  radii: shape={radii.shape}, dtype={radii.dtype}, "
+                          f"min={radii.min().item()}, max={radii.max().item()}")
+                    print(f"  visibility_filter: shape={visibility_filter.shape}, sum={visibility_filter.sum().item()}")
+                    print(f"  max_radii2D: shape={gaussians.max_radii2D.shape}")
+                    raise
                 gaussians.add_densification_stats(viewspace_point_tensor_grad, visibility_filter)
 
                 if stage == "coarse":
@@ -252,8 +296,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    if gaussians._xyz.shape[0] < 2000000:
-                        gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, max_gaussians=2000000)
+                    if gaussians._xyz.shape[0] < opt.max_gaussians:
+                        gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, max_gaussians=opt.max_gaussians)
                     else:
                         print(f"[ITER {iteration}] Point cap reached ({gaussians._xyz.shape[0]}), skipping densify")
                     
@@ -285,6 +329,15 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
                              checkpoint_iterations, checkpoint, debug_from,
                              gaussians, scene, "coarse", tb_writer, opt.coarse_iterations,timer)
     if not args.no_fine:
+        # Scoped to fine stage only (not coarse, which is already confirmed healthy across
+        # 3000 iterations) -- detect_anomaly adds significant per-backward overhead, and
+        # coarse doesn't need it. This makes the first backward() that produces a NaN/Inf
+        # gradient raise immediately with a full stack trace pointing at the exact op,
+        # instead of silently propagating NaN through _xyz/_scaling as it has been.
+        # Expect this run to CRASH with a traceback within the first ~200 fine iterations
+        # (that's the diagnostic signal, not a new bug) -- the traceback's deepest frame
+        # inside this repo's own code (not torch internals) is what to report back.
+        torch.autograd.set_detect_anomaly(True)
         scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                             checkpoint_iterations, checkpoint, debug_from,
                             gaussians, scene, "fine", tb_writer, opt.iterations,timer)

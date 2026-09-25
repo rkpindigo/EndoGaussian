@@ -149,6 +149,9 @@ class EndoNeRF_Dataset(object):
                 depth = depth / 255.0
                 depth[depth!=0] = (1 / depth[depth!=0])*0.4
                 depth[depth==0] = depth.max()
+                close_depth = np.percentile(depth, 3.0)
+                inf_depth = np.percentile(depth, 99.8)
+                depth = np.clip(depth, close_depth, inf_depth)
                 depth = depth[...,None]
             else:
                 raise ValueError(f"{self.mode} has not been implemented.")
@@ -195,9 +198,19 @@ class EndoNeRF_Dataset(object):
         elif self.mode == 'monocular':
             color, depth, mask = self.get_color_depth_mask(0, mode=self.mode)
             pts, colors, _ = self.get_pts_cam(depth, mask, color, disable_mask=False)
+            # Unlike the binocular branch above, this used every unmasked pixel from a single
+            # frame with no subsampling at all -- confirmed on a real scene (P105/run8, 1280x1024)
+            # to initialize with ~1.03M points, ~34x the binocular branch's fixed 30,000-point
+            # cap, and a plausible major cause of drastically slower per-iteration training
+            # (rasterization cost scales with Gaussian count). Capped the same way binocular is,
+            # for consistency and comparable training speed across modes.
+            num_pts = pts.shape[0]
+            if num_pts > 30_000:
+                sel_idxs = np.random.choice(num_pts, 30_000, replace=False)
+                pts, colors = pts[sel_idxs], colors[sel_idxs]
             pts = self.get_pts_wld(pts, self.image_poses[0])
             normals = np.zeros((pts.shape[0], 3))
-        
+
         return pts, colors, normals
         
     def get_pts_wld(self, pts, pose):
@@ -224,6 +237,9 @@ class EndoNeRF_Dataset(object):
             depth = depth / 255.0
             depth[depth!=0] = (1 / depth[depth!=0])*0.4
             depth[depth==0] = depth.max()
+            close_depth = np.percentile(depth, 3.0)
+            inf_depth = np.percentile(depth, 99.8)
+            depth = np.clip(depth, close_depth, inf_depth)
 
         mask = 1 - np.array(Image.open(self.masks_paths[idx]))/255.0
         color = np.array(Image.open(self.image_paths[idx]))/255.0
