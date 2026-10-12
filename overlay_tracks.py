@@ -48,7 +48,6 @@ Usage:
         reconstruction's frames came from)
 """
 
-import colorsys
 import os
 from argparse import ArgumentParser
 
@@ -66,16 +65,29 @@ CANCER_LABELS = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 22, 24, 28, 30, 
 LABELS_INDEX = [HEALTHY_LABELS, IGNORE_LABELS, CAUTERY_LABELS, LGD_LABELS, HGD_LABELS, CANCER_LABELS]
 SEVERITY_SCALE = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 
+# "Green To Blue Gradient" scheme, index-aligned with LABELS_INDEX/SEVERITY_SCALE above: index 0
+# (HEALTHY_LABELS, severity 0.0) -> Vivid Green, ... index 5 (CANCER_LABELS, severity 1.0) ->
+# Dark Sea Blue. Replaces an earlier single-hue-blue/saturation-ramp encoding, which compressed
+# all 6 severity buckets into a brightness/saturation difference on the same hue -- easy to
+# misread at a glance, especially the low-saturation severe end next to pinkish tissue. A
+# distinct color per bucket (green=cancer-free ... blue=cancer) reads unambiguously regardless
+# of which bucket a marker happens to land in.
+FLIM_COLOR_SCALE_HEX = ["#00D40E", "#00BA2D", "#009658", "#007185", "#0053A8", "#003193"]
 
-def flim_marker_color(df, full_frame, hue, value, min_saturation):
-    """Single-hue severity encoding: among all CSV rows for this frame, find the
-    highest-severity LABELS_INDEX bucket any WLI_4 value falls into, and map that bucket to a
-    saturation level -- fully saturated (1.0, healthy) ramping down to min_saturation
-    (neutral/desaturated, most severe) -- at a fixed hue/value, via SEVERITY_SCALE (0.0=healthy
-    ... 1.0=cancer). Inverted from the more intuitive "severe = more saturated" mapping because
-    on real data most readings land in the healthy bucket, and a low, fixed min_saturation there
-    made nearly every visible marker read as a washed-out near-white blue -- putting the common
-    case (healthy) at full saturation keeps most markers clearly, visibly blue.
+
+def hex_to_rgb01(hex_color):
+    hex_color = hex_color.lstrip("#")
+    return np.array([int(hex_color[i:i + 2], 16) / 255.0 for i in (0, 2, 4)])
+
+
+FLIM_COLOR_SCALE = [hex_to_rgb01(h) for h in FLIM_COLOR_SCALE_HEX]
+
+
+def flim_marker_color(df, full_frame):
+    """Green-to-blue severity encoding: among all CSV rows for this frame, find the
+    highest-severity LABELS_INDEX bucket any WLI_4 value falls into, and look up that bucket's
+    color directly from FLIM_COLOR_SCALE (index-aligned with LABELS_INDEX/SEVERITY_SCALE --
+    bucket 0=healthy=green ... bucket 5=cancer=blue).
 
     Returns None if no CSV row matches this frame, or none of its WLI_4 values fall in any known
     bucket -- the caller skips placing a marker entirely for such a query, leaving the underlying
@@ -90,21 +102,59 @@ def flim_marker_color(df, full_frame, hue, value, min_saturation):
                 matched_index = index
     if matched_index is None:
         return None
-    frac = SEVERITY_SCALE[matched_index]
-    saturation = 1.0 - frac * (1.0 - min_saturation)
-    return np.array(colorsys.hsv_to_rgb(hue, saturation, value))
+    return FLIM_COLOR_SCALE[matched_index]
 
 
-def create_marker_sphere(center, radius, color, num_points=50):
-    """Create a small sphere of colored points as a visible marker."""
-    points = []
-    for _ in range(num_points):
-        offset = np.random.randn(3)
-        offset = offset / np.linalg.norm(offset) * radius * np.random.uniform(0, 1)
-        points.append(center + offset)
-    points = np.array(points)
-    colors = np.tile(color, (num_points, 1))
-    return points, colors
+def blend_recolor_nearby(tree, colors, original_colors, center, radius, blend_radius, marker_color,
+                          ease_power=0.4):
+    """Mark a FLIm detection by recoloring the REAL nearby base-cloud points, instead of adding
+    synthetic points near an estimated surface (a sphere, or a flattened disc along an estimated
+    normal). The real points are already exactly on the true tissue surface -- curved, folded,
+    whatever shape it actually is -- so there's no approximation error from guessing a local
+    normal/tangent plane: recoloring them makes the marker literally conform to the actual
+    reconstructed geometry instead of poking through or hovering near it.
+
+    Points within `radius` of `center` (found via `tree`, built over the same cloud `colors`
+    indexes into) get set to the exact `marker_color` -- a solid core. Points out to
+    `blend_radius` get blended between `marker_color` (at `radius`) and that point's OWN color (at
+    `blend_radius`) by distance, so the marker fades into its real surroundings instead of ending
+    in a hard color boundary.
+
+    The blend fraction `t` is raised to `ease_power` (< 1) before mixing, instead of interpolating
+    RGB linearly by raw distance. A straight linear RGB blend from a vivid, saturated marker color
+    toward a pale tissue tone barely LOOKS like it's blending for most of the distance -- e.g.
+    vivid green (0, 0.83, 0.05) mixed 60% of the way to a typical pale tissue tone (0.85, 0.72,
+    0.68) is still (0.51, 0.76, 0.43), clearly green-dominant, just dimmer -- because the green
+    channel is already close between the two colors, so only red/blue visibly climb, and only
+    very near the outer edge does the mix actually read as tissue-colored. Easing `t` with a power
+    < 1 front-loads the transition (reaches a visibly tissue-leaning mix much closer to `radius`
+    instead of saving it all for right before `blend_radius`), so the fade is visible throughout
+    the halo rather than looking like a uniformly dim solid core.
+
+    `original_colors` must be a snapshot of `colors` taken BEFORE any marker in this batch was
+    processed -- blend targets are always read from that snapshot, never from the live `colors`
+    array, so markers whose blend radii overlap don't compound onto each other.
+
+    Returns the number of real points touched (0 if none fall within blend_radius -- e.g. a
+    sparse/thin region of the reconstruction).
+    """
+    idxs = tree.query_ball_point(center, blend_radius)
+    if not idxs:
+        return 0
+    idxs = np.asarray(idxs)
+    dists = np.linalg.norm(tree.data[idxs] - center, axis=1)
+
+    solid = dists <= radius
+    colors[idxs[solid]] = marker_color
+
+    blend_mask = ~solid
+    if blend_mask.any() and blend_radius > radius:
+        b_idx = idxs[blend_mask]
+        t_raw = np.clip((dists[blend_mask] - radius) / (blend_radius - radius), 0.0, 1.0)
+        t = (t_raw ** ease_power)[:, None]
+        colors[b_idx] = np.asarray(marker_color)[None, :] * (1 - t) + original_colors[b_idx] * t
+
+    return len(idxs)
 
 
 def backproject_pixel(depth_map, u, v, focal_x, focal_y, width, height):
@@ -139,6 +189,42 @@ def backproject_pixel(depth_map, u, v, focal_x, focal_y, width, height):
     return np.array([x_cam, y_cam, d])
 
 
+def reproject_across_frames(depth_map, u, v, wvt_source, wvt_target, focal_x, focal_y, width, height):
+    """Like backproject_pixel, but for placing a marker computed at pixel (u,v) of the SOURCE
+    frame's OWN depth map onto a DIFFERENT TARGET frame's point cloud. Naively reusing
+    backproject_pixel's camera-space output for that (as overlay_all_traces.py first did) is
+    wrong whenever the camera moved between the two frames -- "in front" in one frame's camera
+    space is not "in front" in another's. This instead: (1) backprojects in RAW depth units
+    (matching render.py's own _unproject_to_world/_reproject_from_world, which is what its
+    world_view_transforms.npy values are meant to be used with -- NOT the /1000-scaled units
+    backproject_pixel returns), (2) transforms world-ward via the SOURCE frame's
+    world_view_transform (world->camera, row-vector: p_cam_row = p_world_row_homog @ wvt), (3)
+    transforms into the TARGET frame's camera space via the TARGET's world_view_transform, then
+    (4) divides by 1000 at the end to land in the same ply-scale units backproject_pixel uses.
+
+    Returns a (3,) point in the TARGET frame's OWN camera-space (ply-scale) coordinates, or
+    None if (u,v) is out of bounds/has no valid depth in the source frame, or the point
+    reprojects behind the target camera.
+    """
+    ui, vi = int(round(u)), int(round(v))
+    if ui < 0 or ui >= width or vi < 0 or vi >= height:
+        return None
+    d = float(depth_map[vi, ui])
+    if d <= 0:
+        return None
+
+    cx, cy = width / 2.0, height / 2.0
+    x_cam = (ui - cx) * d / focal_x
+    y_cam = (vi - cy) * d / focal_y
+    cam_pt_h = np.array([x_cam, y_cam, d, 1.0])
+    world_pt_h = cam_pt_h @ np.linalg.inv(wvt_source)
+    target_pt_h = world_pt_h @ wvt_target
+    x_t, y_t, z_t = target_pt_h[:3]
+    if z_t <= 1e-8:
+        return None
+    return np.array([x_t, y_t, z_t]) / 1000.0
+
+
 def main():
     parser = ArgumentParser(description="Overlay CoTracker/FLIm tracks on reconstructed "
                                          "point clouds using the model's own rendered depth")
@@ -170,37 +256,49 @@ def main():
     parser.add_argument("--marker_color", type=int, nargs=3, default=[0, 255, 0],
                         help="Marker color RGB 0-255 (default: green)")
     parser.add_argument("--marker_radius", type=float, default=None,
-                        help="Radius of the marker sphere, in the same units as the point "
-                             "cloud. Default: auto-scaled per-frame to 1%% of that frame's own "
+                        help="Reference radius for a marker's overall size, in the same units "
+                             "as the point cloud -- see --solid_core_fraction/--blend_radius_"
+                             "factor for how it's actually split into a solid core vs. a blend "
+                             "halo. Default: auto-scaled per-frame to 0.22%% of that frame's own "
                              "bounding-box diagonal -- these clouds are built with Open3D's "
                              "implicit depth_scale=1000 (see backproject_pixel), so their scale "
                              "is typically sub-millimeter and a fixed absolute default like the "
                              "old 0.005 would dwarf the entire reconstruction.")
-    parser.add_argument("--num_neighbors", type=int, default=20,
-                        help="Number of nearby real cloud points to also recolor")
-    parser.add_argument("--marker_points", type=int, default=80,
-                        help="Number of synthetic points in the marker sphere")
+    parser.add_argument("--solid_core_fraction", type=float, default=0.1,
+                        help="Real cloud points within marker_radius*this fraction are fully "
+                             "solid marker color; beyond that (out to the blend halo) they're "
+                             "linearly recolored. Lowered from an implicit 1.0 (the entire core "
+                             "was solid, blending only started AT marker_radius) -- that made "
+                             "the solid region dominate the marker's visible area, so the blend "
+                             "was too thin a sliver at the very edge to notice. At 0.1, blending "
+                             "starts almost immediately outside the center instead.")
+    parser.add_argument("--blend_radius_factor", type=float, default=2.5,
+                        help="Real cloud points beyond the solid core but within "
+                             "marker_radius*this factor are linearly recolored from the marker "
+                             "color (at the core's edge) to their OWN original color (at the "
+                             "halo's outer edge) -- softens the marker into its real surroundings "
+                             "instead of a hard color boundary. Set to 1.0 to disable (no halo, "
+                             "just the solid core).")
+    parser.add_argument("--blend_ease_power", type=float, default=0.4,
+                        help="Exponent applied to the halo's distance-based blend fraction "
+                             "before mixing colors (<1 front-loads the transition). A plain "
+                             "linear RGB blend (power=1.0) from a vivid marker color toward a "
+                             "pale tissue tone barely looks like it's fading for most of the "
+                             "halo -- e.g. green mixed 60%% of the way to tissue is still "
+                             "clearly green, just dimmer -- because the green channel is "
+                             "already close between the two colors, so only red/blue visibly "
+                             "shift. A power < 1 reaches a visibly tissue-leaning mix much "
+                             "sooner instead of saving nearly all the change for right before "
+                             "the halo's outer edge. See blend_recolor_nearby.")
     parser.add_argument("--color_by_flim", action="store_true",
                         help="Color each marker by the WLI_4 tissue-label severity found at "
                              "its frame in the FLIm CSV, instead of a fixed --marker_color. "
-                             "Uses a single hue (--flim_color) whose SATURATION is set by the "
-                             "bucketed severity fraction (SEVERITY_SCALE[bucket]) -- fully "
-                             "saturated (healthiest) ramping down to --flim_min_saturation "
-                             "(most severe, neutral/desaturated). Queries with no matching/"
+                             "Uses the Green To Blue Gradient scheme (FLIM_COLOR_SCALE): a "
+                             "distinct color per severity bucket, green (healthy) through blue "
+                             "(cancer) -- see flim_marker_color. Queries with no matching/"
                              "known-label CSV row at "
                              "their seed frame are never marked at all -- the underlying "
                              "reconstructed tissue color is left untouched for them.")
-    parser.add_argument("--flim_color", type=int, nargs=3, default=[0, 102, 255],
-                        help="RGB 0-255 defining the hue (and value) used for FLIm severity "
-                             "markers at full saturation, only used with --color_by_flim "
-                             "(default: blue)")
-    parser.add_argument("--flim_min_saturation", type=float, default=0.15,
-                        help="Saturation (0-1) used for the MOST SEVERE (last bucket) severity -- "
-                             "the low/neutral end of the single-hue scale, only used with "
-                             "--color_by_flim. Healthy markers are always fully saturated (1.0); "
-                             "this only controls how washed-out the severe end gets. 0 would "
-                             "render the most severe markers fully desaturated/white; keep this "
-                             "above 0 so they still read as (pale) blue rather than white.")
     parser.add_argument("--flim_csv", type=str,
                         default="/media/data/zliwang/data/HN_P2C_20250304.csv",
                         help="FLIm CSV path (only used with --color_by_flim)")
@@ -241,7 +339,6 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     fixed_color_float = np.array(args.marker_color) / 255.0
-    flim_hue, _, flim_value = colorsys.rgb_to_hsv(*(np.array(args.flim_color) / 255.0))
 
     flim_df = None
     if args.color_by_flim:
@@ -262,8 +359,7 @@ def main():
         query_has_color = np.zeros(N, dtype=bool)
         for i in range(N):
             full_frame = int(seed_frames[i]) * args.csv_frame_stride + args.csv_frame_offset
-            color = flim_marker_color(flim_df, full_frame, flim_hue, flim_value,
-                                       args.flim_min_saturation)
+            color = flim_marker_color(flim_df, full_frame)
             if color is not None:
                 query_colors[i] = color
                 query_has_color[i] = True
@@ -322,33 +418,29 @@ def main():
         if args.marker_radius is not None:
             radius = args.marker_radius
         elif len(points) > 0:
-            radius = 0.01 * np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+            radius = (0.02 / 9.0) * np.linalg.norm(points.max(axis=0) - points.min(axis=0))
         else:
             radius = 0.005
 
-        tree = cKDTree(points) if (len(points) > 0 and args.num_neighbors > 0) else None
-        all_sphere_pts = [points]
-        all_sphere_cols = [colors]
+        solid_radius = radius * args.solid_core_fraction
+        blend_radius = radius * args.blend_radius_factor
+        original_colors = colors.copy()
+        tree = cKDTree(points) if len(points) > 0 else None
+        n_touched = 0
         for cam_pt, marker_color_float in zip(marker_pts, marker_cols):
             if tree is not None:
-                _, neighbor_indices = tree.query(cam_pt, k=min(args.num_neighbors, len(points)))
-                for idx in np.atleast_1d(neighbor_indices):
-                    colors[idx] = marker_color_float
-            sphere_pts, sphere_cols = create_marker_sphere(
-                cam_pt, radius, marker_color_float, num_points=args.marker_points)
-            all_sphere_pts.append(sphere_pts)
-            all_sphere_cols.append(sphere_cols)
+                n_touched += blend_recolor_nearby(
+                    tree, colors, original_colors, cam_pt, solid_radius, blend_radius, marker_color_float,
+                    ease_power=args.blend_ease_power)
 
-        annotated = o3d.geometry.PointCloud()
-        annotated.points = o3d.utility.Vector3dVector(np.vstack(all_sphere_pts))
-        annotated.colors = o3d.utility.Vector3dVector(np.vstack(all_sphere_cols))
-        o3d.io.write_point_cloud(out_path, annotated)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        o3d.io.write_point_cloud(out_path, pcd)
         n_frames_annotated += 1
         n_markers_total += len(marker_pts)
 
         if k % 50 == 0:
             print(f"  ply frame_{i_frame} (true video frame {true_frame}): "
-                  f"{len(marker_pts)} active FLIm markers")
+                  f"{len(marker_pts)} active FLIm markers, {n_touched} real points recolored")
 
     print(f"\nDone. Annotated {n_frames_annotated}/{len(frame_idxs)} frames with "
           f"{n_markers_total} total markers placed. Saved to: {output_dir}")

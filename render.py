@@ -248,10 +248,23 @@ def _reproject_from_world(world_pts, wvt, focal_x, focal_y, width, height):
 def _bilateral_clip(depth_np):
     """Same bilateral-filter + percentile-clip cleanup the original per-frame pipeline always
     did -- given a depth map with holes (if any) already zeroed. Runs on ONE frame's own depth
-    only, so it never gets influenced by what's happening in a different frame's fill-in."""
+    only, so it never gets influenced by what's happening in a different frame's fill-in.
+
+    sigmaColor is derived from THIS FRAME'S OWN valid-depth range rather than a fixed absolute
+    constant (was 64). Checked against a real P202/run7 stereo reconstruction: 64 works out to
+    ~44% of a typical frame's actual depth range (~143-149), looser than the 10% ratio found to
+    give better edge preservation when this was first diagnosed on a monocular scene (where 64
+    was ~90x the entire depth span -- a much more severe break, but the direction of the bug is
+    the same: a looser-than-necessary sigmaColor smooths across real depth edges more than it
+    needs to). Testing whether tightening this also measurably reduces blur/softness in stereo
+    reconstructions, separately from all the training-side levers already tried for that.
+    """
     import cv2
     zero_mask = (depth_np == 0)
-    depth_smoother = (128, 64, 64)
+    valid_for_scale = depth_np[~zero_mask]
+    depth_range = float(valid_for_scale.max() - valid_for_scale.min()) if valid_for_scale.size > 0 else 0.0
+    sigma_color = max(depth_range * 0.1, 1e-6)
+    depth_smoother = (128, sigma_color, 64)
     out = cv2.bilateralFilter(depth_np, depth_smoother[0], depth_smoother[1], depth_smoother[2])
     valid_depth = out[out != 0]
     if valid_depth.size == 0:
