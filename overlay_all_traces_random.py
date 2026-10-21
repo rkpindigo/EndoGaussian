@@ -17,7 +17,7 @@ between frames, not camera motion).
 
 Usage:
     python overlay_all_traces_random.py \
-        --reconstruct_dir reconstruct/headAndNeck/P202/run7_densified \
+        --reconstruct_dir reconstruct/headAndNeck/P202/run7_stereo_densified \
         --tracks data/headAndNeck/tracks/P202/run7/cotracker_tracks.npy \
         --seed_frames data/headAndNeck/tracks/P202/run7/cotracker_seed_frames.npy \
         --target_frame 12 \
@@ -32,7 +32,7 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
 
-from overlay_tracks import backproject_pixel, blend_recolor_nearby, FLIM_COLOR_SCALE
+from overlay_tracks import backproject_pixel, accumulate_marker_blend, finalize_blend, FLIM_COLOR_SCALE
 
 
 def main():
@@ -113,9 +113,10 @@ def main():
     blend_radius = radius * args.blend_radius_factor
     tree = cKDTree(base_points) if len(base_points) > 0 else None
     original_colors = base_colors.copy()
+    weighted_color_sum = np.zeros_like(base_colors)
+    weight_sum = np.zeros(len(base_colors))
 
     n_placed = 0
-    n_touched_total = 0
     skip_no_depth = 0
 
     for i in range(N):
@@ -128,10 +129,13 @@ def main():
         color = random.choice(FLIM_COLOR_SCALE)
 
         if tree is not None:
-            n_touched_total += blend_recolor_nearby(
-                tree, base_colors, original_colors, cam_pt, solid_radius, blend_radius, color,
+            accumulate_marker_blend(
+                tree, weighted_color_sum, weight_sum, cam_pt, solid_radius, blend_radius, color,
                 ease_power=args.blend_ease_power)
         n_placed += 1
+
+    n_touched_total = finalize_blend(base_colors, original_colors, weighted_color_sum, weight_sum) \
+        if tree is not None else 0
 
     print(f"Placed {n_placed}/{N} FLIm markers onto frame {args.target_frame} with a random "
           f"FLIM_COLOR_SCALE severity bucket each ({skip_no_depth} skipped: no valid depth at "

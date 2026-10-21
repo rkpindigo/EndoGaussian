@@ -109,6 +109,7 @@ class OptimizationParams(ParamGroup):
         self.dataloader=False
         self.iterations = 30_000
         self.coarse_iterations = 3000
+        self.coarse_reference_frame = 0
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01

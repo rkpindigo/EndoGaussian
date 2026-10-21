@@ -105,35 +105,45 @@ def flim_marker_color(df, full_frame):
     return FLIM_COLOR_SCALE[matched_index]
 
 
-def blend_recolor_nearby(tree, colors, original_colors, center, radius, blend_radius, marker_color,
-                          ease_power=0.4):
-    """Mark a FLIm detection by recoloring the REAL nearby base-cloud points, instead of adding
-    synthetic points near an estimated surface (a sphere, or a flattened disc along an estimated
-    normal). The real points are already exactly on the true tissue surface -- curved, folded,
-    whatever shape it actually is -- so there's no approximation error from guessing a local
-    normal/tangent plane: recoloring them makes the marker literally conform to the actual
-    reconstructed geometry instead of poking through or hovering near it.
+def accumulate_marker_blend(tree, weighted_color_sum, weight_sum, center, radius, blend_radius,
+                             marker_color, ease_power=0.4):
+    """Mark a FLIm detection by ACCUMULATING a weighted contribution toward the REAL nearby
+    base-cloud points, instead of adding synthetic points near an estimated surface, and instead
+    of directly overwriting their color. The real points are already exactly on the true tissue
+    surface -- curved, folded, whatever shape it actually is -- so there's no approximation error
+    from guessing a local normal/tangent plane: recoloring them makes the marker literally
+    conform to the actual reconstructed geometry instead of poking through or hovering near it.
+
+    This must be called once per marker, into the SAME `weighted_color_sum` ((N,3), zero-
+    initialized) / `weight_sum` ((N,), zero-initialized) pair of arrays for every marker in a
+    batch, followed by ONE call to `finalize_blend` after the whole batch -- never write directly
+    to the point cloud's actual colors per-marker. Earlier versions did exactly that (direct
+    per-marker overwrite of `colors[idx]`), which looked fine for an isolated marker but produced
+    a hard, visibly wrong clipped-circle boundary wherever two markers' blend halos overlapped:
+    whichever marker got processed second completely erased the first one's contribution at the
+    shared points instead of blending with it (confirmed visually -- a scalloped hard edge between
+    a blue and a green halo, not a smooth transition). Accumulating every marker's weighted
+    contribution first, and only computing final colors once at the end, lets overlapping markers
+    properly average together instead of one clobbering the other.
 
     Points within `radius` of `center` (found via `tree`, built over the same cloud `colors`
-    indexes into) get set to the exact `marker_color` -- a solid core. Points out to
-    `blend_radius` get blended between `marker_color` (at `radius`) and that point's OWN color (at
-    `blend_radius`) by distance, so the marker fades into its real surroundings instead of ending
-    in a hard color boundary.
+    indexes into) get weight 1.0 -- a solid core. Points out to `blend_radius` get a weight
+    linearly-by-distance down to 0 (eased, see below), representing how much this marker should
+    contribute at that point. `finalize_blend` combines every marker's weighted contributions
+    together, with any remaining weight (up to 1 total) filled in by the point's own original
+    tissue color -- so a single, isolated marker still fades to tissue exactly as before, while
+    overlapping markers now blend with each other rather than overwriting.
 
-    The blend fraction `t` is raised to `ease_power` (< 1) before mixing, instead of interpolating
-    RGB linearly by raw distance. A straight linear RGB blend from a vivid, saturated marker color
-    toward a pale tissue tone barely LOOKS like it's blending for most of the distance -- e.g.
-    vivid green (0, 0.83, 0.05) mixed 60% of the way to a typical pale tissue tone (0.85, 0.72,
-    0.68) is still (0.51, 0.76, 0.43), clearly green-dominant, just dimmer -- because the green
-    channel is already close between the two colors, so only red/blue visibly climb, and only
-    very near the outer edge does the mix actually read as tissue-colored. Easing `t` with a power
-    < 1 front-loads the transition (reaches a visibly tissue-leaning mix much closer to `radius`
-    instead of saving it all for right before `blend_radius`), so the fade is visible throughout
-    the halo rather than looking like a uniformly dim solid core.
-
-    `original_colors` must be a snapshot of `colors` taken BEFORE any marker in this batch was
-    processed -- blend targets are always read from that snapshot, never from the live `colors`
-    array, so markers whose blend radii overlap don't compound onto each other.
+    The weight's falloff is raised to `ease_power` (< 1) before use, instead of linear-by-distance.
+    A straight linear RGB blend from a vivid, saturated marker color toward a pale tissue tone
+    barely LOOKS like it's blending for most of the distance -- e.g. vivid green (0, 0.83, 0.05)
+    mixed 60% of the way to a typical pale tissue tone (0.85, 0.72, 0.68) is still (0.51, 0.76,
+    0.43), clearly green-dominant, just dimmer -- because the green channel is already close
+    between the two colors, so only red/blue visibly climb, and only very near the outer edge does
+    the mix actually read as tissue-colored. Easing front-loads the transition (reaches a visibly
+    tissue-leaning mix much closer to `radius` instead of saving it all for right before
+    `blend_radius`), so the fade is visible throughout the halo rather than looking like a
+    uniformly dim solid core.
 
     Returns the number of real points touched (0 if none fall within blend_radius -- e.g. a
     sparse/thin region of the reconstruction).
@@ -144,16 +154,37 @@ def blend_recolor_nearby(tree, colors, original_colors, center, radius, blend_ra
     idxs = np.asarray(idxs)
     dists = np.linalg.norm(tree.data[idxs] - center, axis=1)
 
-    solid = dists <= radius
-    colors[idxs[solid]] = marker_color
-
-    blend_mask = ~solid
+    weight = np.ones(len(idxs))
+    blend_mask = dists > radius
     if blend_mask.any() and blend_radius > radius:
-        b_idx = idxs[blend_mask]
         t_raw = np.clip((dists[blend_mask] - radius) / (blend_radius - radius), 0.0, 1.0)
-        t = (t_raw ** ease_power)[:, None]
-        colors[b_idx] = np.asarray(marker_color)[None, :] * (1 - t) + original_colors[b_idx] * t
+        weight[blend_mask] = 1.0 - (t_raw ** ease_power)
 
+    weighted_color_sum[idxs] += weight[:, None] * np.asarray(marker_color)[None, :]
+    weight_sum[idxs] += weight
+
+    return len(idxs)
+
+
+def finalize_blend(colors, original_colors, weighted_color_sum, weight_sum):
+    """Call exactly once, after every marker in a batch has been accumulated via
+    `accumulate_marker_blend` into the same `weighted_color_sum`/`weight_sum` pair. Writes final
+    colors into `colors` for every point touched by at least one marker: the (normalized) average
+    of every contributing marker's color, blended with the point's own `original_colors` entry by
+    however much total marker weight it received (capped at 1 -- a point saturated by overlapping
+    markers shows pure marker-color blend with no tissue showing through, same as a point deep
+    inside a single marker's solid core always has).
+
+    Returns the number of real points that received any marker contribution.
+    """
+    touched = weight_sum > 0
+    idxs = np.nonzero(touched)[0]
+    if len(idxs) == 0:
+        return 0
+    w = weight_sum[idxs]
+    w_clamped = np.minimum(w, 1.0)[:, None]
+    marker_part = weighted_color_sum[idxs] / np.maximum(w, 1e-8)[:, None]
+    colors[idxs] = marker_part * w_clamped + original_colors[idxs] * (1 - w_clamped)
     return len(idxs)
 
 
@@ -426,12 +457,16 @@ def main():
         blend_radius = radius * args.blend_radius_factor
         original_colors = colors.copy()
         tree = cKDTree(points) if len(points) > 0 else None
+        weighted_color_sum = np.zeros_like(colors)
+        weight_sum = np.zeros(len(colors))
         n_touched = 0
         for cam_pt, marker_color_float in zip(marker_pts, marker_cols):
             if tree is not None:
-                n_touched += blend_recolor_nearby(
-                    tree, colors, original_colors, cam_pt, solid_radius, blend_radius, marker_color_float,
-                    ease_power=args.blend_ease_power)
+                accumulate_marker_blend(
+                    tree, weighted_color_sum, weight_sum, cam_pt, solid_radius, blend_radius,
+                    marker_color_float, ease_power=args.blend_ease_power)
+        if tree is not None:
+            n_touched = finalize_blend(colors, original_colors, weighted_color_sum, weight_sum)
 
         pcd.colors = o3d.utility.Vector3dVector(colors)
         o3d.io.write_point_cloud(out_path, pcd)

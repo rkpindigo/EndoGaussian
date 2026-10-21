@@ -68,6 +68,15 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     if not viewpoint_stack:
         viewpoint_stack = scene.getTrainCameras()
 
+    # The coarse stage only ever trains on ONE fixed camera (see `if stage == 'coarse'` below) --
+    # Camera.uid is the true dataset/video frame number (see scene/endo_loader.py::format_infos,
+    # which builds every Camera with uid=idx), not the position within viewpoint_stack (train
+    # frames are a subset of the full video, skipping whichever frames landed in the test split),
+    # so this resolves opt.coarse_reference_frame (default 0, preserving prior behavior) to the
+    # matching viewpoint_stack position once, up front -- viewpoint_stack itself is never
+    # reshuffled or popped after this point, so a fixed index stays valid for the whole run.
+    coarse_ref_idx = next(i for i, cam in enumerate(viewpoint_stack) if cam.uid == opt.coarse_reference_frame)
+
     print("opacity_threshold_coarse:", opt.opacity_threshold_coarse)
     print("opacity_threshold_fine_init:", opt.opacity_threshold_fine_init)
     print("opacity_threshold_fine_after:", opt.opacity_threshold_fine_after)
@@ -94,7 +103,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         if iteration % 500 == 0:
             gaussians.oneupSHdegree()
         if stage == 'coarse':
-            idx = 0
+            idx = coarse_ref_idx
         else:
             idx = randint(0, len(viewpoint_stack)-1)
         viewpoint_cams = [viewpoint_stack[idx]]

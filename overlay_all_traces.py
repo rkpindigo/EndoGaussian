@@ -47,7 +47,7 @@ import open3d as o3d
 import pandas as pd
 from scipy.spatial import cKDTree
 
-from overlay_tracks import backproject_pixel, blend_recolor_nearby, flim_marker_color
+from overlay_tracks import backproject_pixel, accumulate_marker_blend, finalize_blend, flim_marker_color
 
 
 def main():
@@ -139,9 +139,10 @@ def main():
     blend_radius = radius * args.blend_radius_factor
     tree = cKDTree(base_points) if len(base_points) > 0 else None
     original_colors = base_colors.copy()
+    weighted_color_sum = np.zeros_like(base_colors)
+    weight_sum = np.zeros(len(base_colors))
 
     n_placed = 0
-    n_touched_total = 0
     skip_no_depth = skip_no_label = 0
 
     for i in range(N):
@@ -160,10 +161,13 @@ def main():
             continue
 
         if tree is not None:
-            n_touched_total += blend_recolor_nearby(
-                tree, base_colors, original_colors, cam_pt, solid_radius, blend_radius, color,
+            accumulate_marker_blend(
+                tree, weighted_color_sum, weight_sum, cam_pt, solid_radius, blend_radius, color,
                 ease_power=args.blend_ease_power)
         n_placed += 1
+
+    n_touched_total = finalize_blend(base_colors, original_colors, weighted_color_sum, weight_sum) \
+        if tree is not None else 0
 
     print(f"Placed {n_placed}/{N} FLIm markers onto frame {args.target_frame} "
           f"({skip_no_label} skipped: no matching CSV label, "
